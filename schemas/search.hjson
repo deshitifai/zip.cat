@@ -1,0 +1,204 @@
+{
+  SearchRequest: {
+    type: object
+    required: [query]
+    properties: {
+      query: {
+        type: string
+        minLength: 1
+      }
+      limit: {
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 12
+      }
+      trigger: {
+        $ref: "#/SearchTrigger"
+      }
+    }
+  }
+
+  SearchTrigger: {
+    type: object
+    required: [type, key, source]
+    properties: {
+      type: {
+        const: keyboard
+      }
+      key: {
+        const: Enter
+      }
+      source: {
+        const: search-box
+      }
+    }
+  }
+
+  SuggestTrigger: {
+    type: object
+    required: [type, source]
+    properties: {
+      type: {
+        const: input-change
+      }
+      source: {
+        const: search-box
+      }
+    }
+  }
+
+  ResultPlacement: {
+    type: object
+    required: [target, renderer]
+    properties: {
+      target: {
+        const: results
+      }
+      renderer: {
+        const: url-table
+      }
+    }
+  }
+
+  SearchResult: {
+    type: object
+    required: [url, provider]
+    properties: {
+      title: {
+        type: string
+      }
+      url: {
+        type: string
+        format: uri
+      }
+      score: {
+        type: number
+      }
+      provider: {
+        type: string
+        const: exa.web-search
+      }
+    }
+  }
+
+  SearchPluginResultSet: {
+    type: object
+    required: [pluginId, placement, schema, results]
+    properties: {
+      pluginId: {
+        type: string
+      }
+      placement: {
+        $ref: "#/ResultPlacement"
+      }
+      schema: {
+        type: object
+      }
+      results: {
+        type: array
+        items: {
+          $ref: "#/SearchResult"
+        }
+      }
+    }
+  }
+
+  SearchResponse: {
+    type: object
+    required: [query, results, resultSets, elapsedMs]
+    properties: {
+      query: {
+        type: string
+      }
+      results: {
+        type: array
+        items: {
+          $ref: "#/SearchResult"
+        }
+      }
+      resultSets: {
+        type: array
+        items: {
+          $ref: "#/SearchPluginResultSet"
+        }
+      }
+      elapsedMs: {
+        type: integer
+        minimum: 0
+      }
+    }
+  }
+
+  WikipediaSuggestion: {
+    type: object
+    required: [title, url, provider]
+    properties: {
+      title: {
+        type: string
+      }
+      url: {
+        type: string
+        format: uri
+      }
+      provider: {
+        type: string
+        const: wikipedia.title
+      }
+    }
+  }
+
+  WiktionarySuggestion: {
+    type: object
+    required: [title, url, provider]
+    properties: {
+      title: {
+        type: string
+      }
+      url: {
+        type: string
+        format: uri
+      }
+      description: {
+        type: string
+      }
+      fullDescription: {
+        type: string
+      }
+      provider: {
+        type: string
+        const: wiktionary.headword
+      }
+    }
+  }
+
+  SuggestResponse: {
+    type: object
+    required: [query, suggestions, resultSets, elapsedMs]
+    properties: {
+      query: {
+        type: string
+      }
+      suggestions: {
+        type: array
+        items: {
+          oneOf: [
+            {
+              $ref: "#/WikipediaSuggestion"
+            }
+            {
+              $ref: "#/WiktionarySuggestion"
+            }
+          ]
+        }
+      }
+      resultSets: {
+        type: array
+      }
+      elapsedMs: {
+        type: integer
+        minimum: 0
+      }
+    }
+  }
+}
