@@ -13,9 +13,9 @@ export async function suggest(registry: PluginRegistry, request: SuggestRequest)
     startedAt
   };
 
-  if (!context.request.query) {
+  if (!context.request.query || context.request.query.startsWith("/")) {
     return {
-      query: "",
+      query: context.request.query,
       suggestions: [],
       resultSets: [],
       elapsedMs: 0

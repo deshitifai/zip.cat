@@ -83,6 +83,23 @@ Event or duplicate-detection builds may also need:
 | `dew.cat` | stage `index.html styles.css script.js`; deploy `dew-cat` |
 | `zip.cat` | inspect `package.json` before deploy; add this repo to CATS inventory before launch |
 
+## zip.cat Local Development
+
+The user runs the local zip.cat dev server. Agents should not start, stop, or
+restart the server unless the user explicitly asks.
+
+Use this command for hot reloading during local development:
+
+```sh
+bun run dev
+```
+
+The `dev` script runs `bun --watch src/server.ts`, which restarts the server
+process when server-side files change. The server also rebuilds `/client.js` on
+each request during local development, so browser/client changes are picked up by
+reloading the page. If a browser view looks stale, reload the page rather than
+restarting the server.
+
 ## GitHub Actions Baseline
 
 Each site repo should have `.github/workflows/deploy.yml` with:
@@ -110,4 +127,3 @@ Time-sensitive sites must scrape or crawl before build:
 - Do not revert unrelated local changes.
 - Confirm before first public launch of a brand-new domain.
 - Prefer additive fixes and idempotent Cloudflare API calls.
-
