@@ -6,6 +6,16 @@ type ExaSearchType = "instant" | "fast" | "auto" | "deep-lite" | "deep";
 
 export abstract class GenericWebSearchGenerator extends WebSearchGenerator {}
 
+function pricingForSearchType(searchType: ExaSearchType, numResults: number) {
+  if (searchType === "deep") {
+    return "Exa Deep public pricing: $12/1k requests.";
+  }
+
+  return numResults <= 10
+    ? "Exa Search public pricing: $7/1k requests up to 10 results."
+    : `Exa Search public pricing: $7/1k requests up to 10 results; additional results may add cost (${numResults} requested here).`;
+}
+
 export abstract class ExaWebSearchGenerator extends GenericWebSearchGenerator {
   readonly provider = "exa";
   readonly api = "Exa search";
@@ -26,7 +36,8 @@ export abstract class ExaWebSearchGenerator extends GenericWebSearchGenerator {
       api: this.api,
       effort: this.effort,
       label: this.searchType,
-      detail: `type ${this.searchType}, numResults ${this.numResults}`
+      detail: `type ${this.searchType}, numResults ${this.numResults}`,
+      pricing: pricingForSearchType(this.searchType, this.numResults)
     };
   }
 

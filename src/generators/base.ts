@@ -11,6 +11,7 @@ export interface GeneratorDescriptor {
   effort: EffortLevel;
   label: string;
   detail: string;
+  pricing?: string;
 }
 
 export interface WebSearchRequest {
@@ -42,6 +43,8 @@ export interface AiGenerationResult {
   text: string;
   model: string;
   provider: string;
+  usage?: Record<string, unknown>;
+  debug?: Record<string, unknown>;
 }
 
 export abstract class AiGenerator extends ResultGenerator<AiGenerateRequest, AiGenerationResult> {

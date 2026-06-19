@@ -16,6 +16,24 @@ export interface AiRequest {
   trigger?: SearchTrigger;
 }
 
+export interface InlineInferenceRequest {
+  query: string;
+  spans: string[];
+  effort?: number;
+}
+
+export interface InlineInferenceResponse {
+  query: string;
+  spans: string[];
+  substitutions: string[];
+  resolvedQuery: string;
+  model: string;
+  provider: string;
+  usage?: Record<string, unknown>;
+  debug?: Record<string, unknown>;
+  elapsedMs: number;
+}
+
 export type EffortLevel = 1 | 2 | 3 | 4 | 5;
 
 export interface SearchResult {
@@ -82,6 +100,11 @@ export interface SuggestionPlacement {
   renderer: "pill";
 }
 
+export interface SlashCommandPlacement {
+  target: "results";
+  renderer: "weather-card" | "json";
+}
+
 export interface SuggestPluginResultSet {
   pluginId: string;
   placement: SuggestionPlacement;
@@ -101,7 +124,54 @@ export interface AiResponse {
   text: string;
   model: string;
   provider: string;
+  usage?: Record<string, unknown>;
+  debug?: Record<string, unknown>;
   elapsedMs: number;
+}
+
+export type SlashArgumentType = "text" | "number" | "boolean" | "choice";
+
+export interface SlashCommandArgument {
+  name: string;
+  label: string;
+  type: SlashArgumentType;
+  required: boolean;
+  placeholder?: string;
+  widthChars?: number;
+  choices?: Array<{
+    label: string;
+    value: string;
+  }>;
+}
+
+export interface SlashCommandDescriptor {
+  id: string;
+  name: string;
+  command: `/${string}`;
+  description: string;
+  arguments: SlashCommandArgument[];
+  placement: SlashCommandPlacement;
+  outputSchema: JsonSchema;
+}
+
+export interface SlashCommandRequest {
+  query: string;
+  command?: string;
+  args?: Record<string, unknown>;
+  trigger?: SearchTrigger;
+}
+
+export interface SlashCommandResponse {
+  commandId: string;
+  commandName: string;
+  command: `/${string}`;
+  query: string;
+  args: Record<string, unknown>;
+  placement: SlashCommandPlacement;
+  schema: JsonSchema;
+  output: unknown;
+  elapsedMs: number;
+  debug?: Record<string, unknown>;
 }
 
 export interface SuggestContext {
@@ -143,4 +213,8 @@ export interface PluginRegistry {
   search: SearchPlugin[];
   suggest: SuggestPlugin[];
   filters: ResultFilterPlugin[];
+}
+
+export interface SlashCommandRegistry {
+  commands: SlashCommandDescriptor[];
 }

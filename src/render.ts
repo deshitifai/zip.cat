@@ -70,15 +70,21 @@ function renderEntry(options: {
 
   return `<div class="query-row">
     <section class="entry" data-mode="search" data-effort="3">
+      <span class="status-label" aria-hidden="true">$0</span>
       ${renderEffortBars(3)}
       <form class="entry-form" action="/" method="get" autocomplete="off">
         <span class="prompt" aria-hidden="true">&gt;</span>
-        <input class="entry-input" aria-label="Previous search" name="q" value="${query}">
+        <span class="input-shell">
+          <textarea class="entry-input" aria-label="Previous search" name="q" rows="1">${query}</textarea>
+          <span class="inline-inference-highlight" aria-hidden="true"></span>
+        </span>
+        <div class="slash-args" hidden></div>
       </form>
       <div class="results">
         ${status}
         ${renderRows(options.response)}
       </div>
+      <div class="debug-panel" hidden></div>
     </section>
     <aside class="query-suggestions live-suggestions" aria-live="polite"></aside>
   </div>`;
@@ -118,20 +124,63 @@ export function renderPage(options: {
     form {
       display: grid;
       grid-template-columns: auto minmax(0, 1fr);
-      align-items: center;
+      align-items: start;
       column-gap: 8px;
       width: 100%;
+    }
+    .entry-form:has(.slash-args:not([hidden])),
+    #terminal-form:has(.slash-args:not([hidden])) {
+      grid-template-columns: auto max-content minmax(120px, 220px) minmax(0, 1fr);
     }
     .entry {
       border: 1px solid #d8d8d8;
       margin-bottom: 18px;
-      padding: 10px 12px 12px;
+      padding: 32px 12px 12px;
       position: relative;
     }
     .current-command {
       border: 1px solid #d8d8d8;
-      padding: 10px 12px 12px;
+      padding: 32px 12px 12px;
       position: relative;
+    }
+    .entry::before,
+    .current-command::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 24px;
+      border-top: 1px solid #d8d8d8;
+    }
+    .entry.run-active-ai {
+      animation: ai-border-pulse 620ms linear infinite;
+    }
+    .entry.run-active-search {
+      animation: search-border-pulse 620ms linear infinite;
+    }
+    .entry.run-active-ai::before,
+    .entry.run-active-ai .results,
+    .entry.run-active-ai .debug-panel {
+      animation: ai-border-top-pulse 620ms linear infinite;
+    }
+    .entry.run-active-search::before,
+    .entry.run-active-search .results,
+    .entry.run-active-search .debug-panel {
+      animation: search-border-top-pulse 620ms linear infinite;
+    }
+    .entry.run-active-ai .prompt {
+      animation: ai-phase-pulse 620ms linear infinite;
+    }
+    .entry.run-active-search .prompt {
+      animation: search-phase-pulse 620ms linear infinite;
+    }
+    .status-label {
+      position: absolute;
+      left: 8px;
+      top: 4px;
+      color: #666;
+      font-size: 13px;
+      line-height: 18px;
     }
     .effort-bars {
       display: inline-flex;
@@ -157,29 +206,346 @@ export function renderPage(options: {
       background: #111;
       border-color: #111;
     }
+    .effort-menu {
+      background: #fff;
+      border: 1px solid #111;
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      max-width: min(420px, calc(100vw - 16px));
+      min-width: 320px;
+      padding: 4px;
+      position: fixed;
+      z-index: 20;
+    }
+    .effort-menu-option {
+      appearance: none;
+      background: #fff;
+      border: 0;
+      color: #111;
+      cursor: pointer;
+      display: grid;
+      gap: 2px;
+      grid-template-columns: 70px minmax(0, 1fr);
+      min-height: 34px;
+      padding: 6px 8px;
+      text-align: left;
+    }
+    .effort-menu-option:hover,
+    .effort-menu-option.active {
+      background: #f2f2f2;
+    }
+    .effort-menu-level {
+      font-size: 13px;
+      line-height: 1.25;
+    }
+    .effort-menu-detail {
+      color: #444;
+      font-size: 12px;
+      line-height: 1.25;
+      min-width: 0;
+    }
+    .run-status {
+      align-items: center;
+      background: transparent;
+      border: 0;
+      box-shadow: none;
+      display: inline-flex;
+      gap: 6px;
+      position: absolute;
+      right: 45px;
+      top: 4px;
+      font-size: 15px;
+      height: 16px;
+      line-height: 16px;
+      overflow: visible;
+    }
+    .run-status-mark {
+      background: transparent;
+      border: 0;
+      box-shadow: none;
+      color: #c8c8c8;
+      display: none;
+      font: inherit;
+      height: 16px;
+      line-height: 16px;
+      overflow: visible;
+      text-shadow: none;
+      transition: color 120ms ease;
+    }
+    .run-status-mark.used {
+      display: inline-flex;
+      align-items: center;
+    }
+    .run-status-mark[data-status-kind="ai"].active {
+      animation: ai-phase-pulse 620ms linear infinite;
+    }
+    .run-status-mark[data-status-kind="search"].active {
+      animation: search-phase-pulse 620ms linear infinite;
+    }
+    .run-status-mark.done {
+      animation: none;
+      color: #128a33;
+    }
+    .run-status-mark.error {
+      animation: none;
+      color: #b00020;
+    }
+    @keyframes ai-phase-pulse {
+      0%, 100% { color: #ff4d00; }
+      20% { color: #ffcc00; }
+      40% { color: #ff008c; }
+      60% { color: #7c2cff; }
+      80% { color: #00b7ff; }
+    }
+    @keyframes search-phase-pulse {
+      0%, 100% { color: #0057ff; }
+      20% { color: #00a3ff; }
+      40% { color: #00d084; }
+      60% { color: #b6f500; }
+      80% { color: #009a44; }
+    }
+    @keyframes ai-border-pulse {
+      0%, 100% { border-color: #ff4d00; }
+      20% { border-color: #ffcc00; }
+      40% { border-color: #ff008c; }
+      60% { border-color: #7c2cff; }
+      80% { border-color: #00b7ff; }
+    }
+    @keyframes search-border-pulse {
+      0%, 100% { border-color: #0057ff; }
+      20% { border-color: #00a3ff; }
+      40% { border-color: #00d084; }
+      60% { border-color: #b6f500; }
+      80% { border-color: #009a44; }
+    }
+    @keyframes ai-border-top-pulse {
+      0%, 100% { border-top-color: #ff4d00; }
+      20% { border-top-color: #ffcc00; }
+      40% { border-top-color: #ff008c; }
+      60% { border-top-color: #7c2cff; }
+      80% { border-top-color: #00b7ff; }
+    }
+    @keyframes search-border-top-pulse {
+      0%, 100% { border-top-color: #0057ff; }
+      20% { border-top-color: #00a3ff; }
+      40% { border-top-color: #00d084; }
+      60% { border-top-color: #b6f500; }
+      80% { border-top-color: #009a44; }
+    }
     .prompt {
       font-size: 15px;
       font-weight: 400;
-      line-height: 1;
+      line-height: 24px;
       transform: none;
     }
-    input {
+    input,
+    textarea {
+      -webkit-appearance: none;
+      appearance: none;
       display: block;
       width: 100%;
       min-width: 0;
-      height: 24px;
-      border: 0;
-      border-radius: 0;
-      background: #fff;
+      min-height: 24px;
+      border: 0 !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      background: transparent;
       color: #111;
       font: inherit;
       font-size: 15px;
       font-weight: 400;
-      outline: none;
+      line-height: 24px;
+      outline: 0 !important;
+      overflow: hidden;
+      overflow-wrap: anywhere;
       padding: 0;
+      resize: none !important;
+      white-space: pre-wrap;
     }
-    input::placeholder { color: #b8b8b8; }
-    .results { margin-top: 10px; width: 100%; }
+    textarea::-webkit-resizer {
+      display: none;
+    }
+    .input-shell {
+      display: block;
+      font: inherit;
+      font-size: 15px;
+      font-weight: 400;
+      grid-column: 2;
+      grid-row: 1;
+      line-height: 24px;
+      min-height: 24px;
+      min-width: 0;
+      position: relative;
+      width: 100%;
+    }
+    .input-shell .entry-input {
+      background: transparent;
+      line-height: 24px;
+      position: relative;
+      z-index: 1;
+    }
+    .entry-form:has(.slash-args:not([hidden])) .input-shell,
+    #terminal-form:has(.slash-args:not([hidden])) .input-shell,
+    .entry-form:has(.slash-args:not([hidden])) .entry-input,
+    #terminal-form:has(.slash-args:not([hidden])) textarea[name="q"] {
+      width: var(--slash-command-width, auto);
+    }
+    .inline-inference-highlight {
+      color: #111;
+      display: none;
+      font: inherit;
+      font-size: 15px;
+      font-weight: 400;
+      inset: 0;
+      letter-spacing: 0;
+      line-height: 24px;
+      overflow: hidden;
+      overflow-wrap: anywhere;
+      pointer-events: none;
+      position: absolute;
+      text-align: left;
+      text-shadow: none;
+      white-space: pre-wrap;
+      width: 100%;
+      z-index: 2;
+    }
+    .entry.command-highlight-active .entry-input,
+    .current-command.command-highlight-active textarea {
+      color: transparent;
+      caret-color: #111;
+      text-shadow: none;
+    }
+    .entry.command-highlight-active .inline-inference-highlight,
+    .current-command.command-highlight-active .inline-inference-highlight {
+      display: block;
+    }
+    .inline-inference-glow {
+      animation: inline-inference-color 900ms linear infinite;
+      font: inherit;
+      font-size: inherit;
+      font-weight: inherit;
+      line-height: inherit;
+      text-shadow: none;
+    }
+    .slash-command-ghost {
+      color: #b8b8b8;
+      font: inherit;
+      font-size: inherit;
+      font-weight: inherit;
+      line-height: inherit;
+      text-shadow: none;
+    }
+    .window-ref-pill {
+      background: #f3f3f3;
+      border: 1px solid #bdbdbd;
+      color: #111;
+      display: inline-block;
+      line-height: 18px;
+      padding: 0 4px;
+      pointer-events: auto;
+      vertical-align: baseline;
+    }
+    .entry.window-reference-target,
+    .current-command.window-reference-target {
+      border-color: #111;
+      background: #f7f7f7;
+      box-shadow: inset 0 0 0 1px #111;
+    }
+    @keyframes inline-inference-color {
+      0%, 100% { color: #a64600; }
+      25% { color: #006278; }
+      50% { color: #6f3bb8; }
+      75% { color: #2c6b00; }
+    }
+    input::placeholder,
+    textarea::placeholder { color: #b8b8b8; }
+    .slash-args {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      grid-column: 3;
+      grid-row: 1;
+      margin: 0;
+    }
+    .slash-args[hidden] {
+      display: none;
+    }
+    .slash-arg {
+      align-items: center;
+      border: 1px solid #d8d8d8;
+      display: inline-grid;
+      gap: 6px;
+      grid-template-columns: minmax(0, 1fr);
+      min-height: 28px;
+      padding: 1px 6px;
+    }
+    .slash-arg-text {
+      min-width: calc(var(--slash-arg-width, 8ch) + 12px);
+      width: calc(var(--slash-arg-width, 8ch) + 12px);
+    }
+    .slash-arg > span,
+    .slash-arg-choice legend {
+      color: #666;
+      font-size: 12px;
+      line-height: 16px;
+    }
+    .slash-arg input {
+      font-size: 13px;
+      line-height: 18px;
+      min-height: 18px;
+    }
+    .slash-arg-text input::placeholder {
+      color: #777;
+    }
+    .slash-arg-checkbox {
+      grid-template-columns: auto auto;
+    }
+    .slash-arg-checkbox input,
+    .slash-arg-choice input {
+      appearance: auto;
+      width: auto;
+    }
+    .slash-arg-choice {
+      border: 1px solid #d8d8d8;
+      display: flex;
+      gap: 8px;
+      margin: 0;
+      padding: 2px 6px;
+    }
+    .results {
+      border-top: 1px solid #d8d8d8;
+      margin: 12px -12px 0;
+      padding: 10px 12px 0;
+      width: auto;
+    }
+    .debug-panel {
+      border-top: 1px solid #d8d8d8;
+      margin: 12px -12px 0;
+      padding: 10px 12px 0;
+      width: auto;
+    }
+    .debug-panel[hidden] {
+      display: none;
+    }
+    .debug-panel pre {
+      background: #f7f7f7;
+      border: 1px solid #d8d8d8;
+      color: #111;
+      font: inherit;
+      font-size: 12px;
+      line-height: 1.35;
+      margin: 0;
+      max-height: 70vh;
+      overflow: auto;
+      padding: 8px;
+      white-space: pre;
+    }
+    .entry.flipped .entry-form,
+    .entry.flipped .results {
+      display: none;
+    }
     .live-suggestions {
       display: flex;
       flex-direction: column;
@@ -316,6 +682,78 @@ export function renderPage(options: {
       text-decoration: none;
     }
     .entry.shortcuts-active .ai-link-shortcut { display: inline; }
+    .slash-json {
+      background: #f7f7f7;
+      border: 1px solid #d8d8d8;
+      font: inherit;
+      font-size: 12px;
+      line-height: 1.35;
+      margin: 0;
+      overflow: auto;
+      padding: 8px;
+      white-space: pre;
+    }
+    .weather-card {
+      display: grid;
+      gap: 10px;
+      font-size: 15px;
+      line-height: 1.35;
+    }
+    .weather-location {
+      color: #555;
+      font-size: 13px;
+    }
+    .weather-current {
+      align-items: baseline;
+      display: flex;
+      gap: 12px;
+    }
+    .weather-temp {
+      font-size: 34px;
+      line-height: 1;
+    }
+    .weather-summary {
+      font-size: 16px;
+    }
+    .weather-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin: 0;
+    }
+    .weather-metrics div {
+      border: 1px solid #d8d8d8;
+      padding: 5px 7px;
+    }
+    .weather-metrics dt {
+      color: #666;
+      font-size: 12px;
+    }
+    .weather-metrics dd {
+      margin: 0;
+    }
+    .weather-days {
+      display: grid;
+      gap: 4px;
+    }
+    .weather-day {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr) 74px 42px;
+      gap: 8px;
+    }
+    .weather-day-date,
+    .weather-day-rain {
+      color: #666;
+    }
+    .weather-day-summary {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .weather-source {
+      color: #777;
+      font-size: 12px;
+    }
     .ai-response table {
       border-collapse: collapse;
       table-layout: auto;
@@ -374,6 +812,15 @@ export function renderPage(options: {
       .live-suggestions {
         order: 2;
       }
+      .slash-args {
+        grid-column: 2;
+        grid-row: auto;
+        margin-top: 8px;
+      }
+      .weather-metrics,
+      .weather-day {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -387,11 +834,16 @@ export function renderPage(options: {
       })}
     </div>
     <div class="query-row current-row">
-      <section class="current-command">
+      <section class="current-command" data-mode="search">
+        <span class="status-label" aria-hidden="true">$0</span>
         ${renderEffortBars(3)}
         <form id="terminal-form" action="/" method="get" autocomplete="off">
           <span class="prompt" aria-hidden="true">&gt;</span>
-          <input autofocus aria-label="Search" name="q" value="">
+          <span class="input-shell">
+            <textarea autofocus aria-label="Search" name="q" rows="1"></textarea>
+            <span class="inline-inference-highlight" aria-hidden="true"></span>
+          </span>
+          <div class="slash-args" hidden></div>
         </form>
       </section>
       <aside id="live-suggestions" class="query-suggestions live-suggestions" aria-live="polite"></aside>
