@@ -1,10 +1,12 @@
 import type { SlashCommandDescriptor } from "../models";
 import { type SlashCommand, createSlashContext } from "./base";
 import { weatherSlashCommand } from "./weather";
+import { lanesSlashCommand } from "./lanes";
 
 export function createSlashCommandRegistry() {
   return [
-    weatherSlashCommand()
+    weatherSlashCommand(),
+    lanesSlashCommand()
   ];
 }
 

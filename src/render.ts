@@ -121,7 +121,42 @@ export function renderPage(options: {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>zip.cat</title>
   <style>
-    * { box-sizing: border-box; }
+${pageStyles}  </style>
+</head>
+<body>
+  <main>
+    <div id="transcript">
+      ${renderEntry({
+        query: options.query ?? "",
+        response: options.response,
+        error: options.error,
+        staticBuild: options.staticBuild
+      })}
+    </div>
+    <div class="query-row current-row">
+      <section class="current-command" data-mode="search">
+        <span class="status-label" aria-hidden="true">$0</span>
+        ${renderEffortBars(options.staticBuild ? 1 : 3, options.staticBuild ? [1] : [1, 2, 3, 4, 5])}
+        <form id="terminal-form" action="/" method="get" autocomplete="off">
+          <span class="prompt" aria-hidden="true">&gt;</span>
+          <span class="input-shell">
+            <textarea autofocus aria-label="Search" name="q" rows="1"></textarea>
+            <span class="inline-inference-highlight" aria-hidden="true"></span>
+          </span>
+          <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+          <div class="slash-args" hidden></div>
+        </form>
+      </section>
+      <aside id="live-suggestions" class="query-suggestions live-suggestions" aria-live="polite"></aside>
+    </div>
+  </main>
+  ${options.staticBuild ? `<script>window.ZIP_CAT_STATIC = true;</script>` : ""}
+  <script type="module" src="/client.js"></script>
+</body>
+</html>`;
+}
+
+export const pageStyles = `    * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; }
     body {
       background: #fff;
@@ -139,16 +174,6 @@ export function renderPage(options: {
       gap: 22px;
       align-items: start;
     }
-    .query-row-thread-child .entry::after {
-      content: "";
-      position: absolute;
-      left: 22px;
-      top: -19px;
-      height: 18px;
-      border-left: 1px solid #aaa;
-      pointer-events: none;
-      z-index: 1;
-    }
     .line,
     form {
       display: grid;
@@ -159,7 +184,7 @@ export function renderPage(options: {
     }
     .entry-form:has(.slash-args:not([hidden])),
     #terminal-form:has(.slash-args:not([hidden])) {
-      grid-template-columns: auto max-content minmax(120px, 220px) auto minmax(0, 1fr);
+      grid-template-columns: auto max-content minmax(120px, 220px) minmax(0, 1fr) auto;
     }
     .entry {
       border: 1px solid #d8d8d8;
@@ -550,7 +575,7 @@ export function renderPage(options: {
     }
     .entry-form:has(.slash-args:not([hidden])) .voice-button,
     #terminal-form:has(.slash-args:not([hidden])) .voice-button {
-      grid-column: 4;
+      grid-column: 5;
     }
     .entry-form:has(.slash-args:not([hidden])) .input-shell,
     #terminal-form:has(.slash-args:not([hidden])) .input-shell,
@@ -662,8 +687,16 @@ export function renderPage(options: {
       padding: 1px 6px;
     }
     .slash-arg-text {
-      min-width: calc(var(--slash-arg-width, 8ch) + 12px);
-      width: calc(var(--slash-arg-width, 8ch) + 12px);
+      border: 0;
+      border-bottom: 1px solid #999;
+      border-radius: 0;
+      min-height: 26px;
+      min-width: var(--slash-arg-width, 8ch);
+      padding: 1px 0;
+      width: var(--slash-arg-width, 8ch);
+    }
+    .slash-arg-text:focus-within {
+      border-bottom-color: #111;
     }
     .slash-arg > span,
     .slash-arg-choice legend {
@@ -675,6 +708,15 @@ export function renderPage(options: {
       font-size: 13px;
       line-height: 18px;
       min-height: 18px;
+    }
+    .slash-arg-text input {
+      background: transparent;
+      border: 0;
+      font-size: 15px;
+      line-height: 24px;
+      outline: none;
+      padding: 0;
+      width: 100%;
     }
     .slash-arg-text input::placeholder {
       color: #777;
@@ -699,6 +741,33 @@ export function renderPage(options: {
       margin: 12px -12px 0;
       padding: 10px 12px 0;
       width: auto;
+      position: relative;
+    }
+    /* Each turn: an editable * message followed by its reply. */
+    .ai-turn + .ai-turn {
+      border-top: 1px solid #d8d8d8;
+      margin-top: 10px;
+      padding-top: 10px;
+    }
+    .ai-turn .thread-followup {
+      margin: 0;
+    }
+    .ai-turn-body {
+      margin-top: 8px;
+    }
+    .ai-turn-body:empty {
+      margin-top: 0;
+    }
+    /* Once a conversation has started, the entry's own prompt row is replaced by
+       the editable turn messages, so hide it to avoid showing the first message
+       twice. */
+    .entry.ai-conversation > .entry-form {
+      display: none;
+    }
+    .entry.ai-conversation > .results {
+      border-top: 0;
+      margin-top: 0;
+      padding-top: 0;
     }
     .debug-panel {
       border-top: 1px solid #d8d8d8;
@@ -1006,6 +1075,86 @@ export function renderPage(options: {
       color: #777;
       font-size: 12px;
     }
+    .lanes-card {
+      display: grid;
+      gap: 8px;
+      font-size: 15px;
+      line-height: 1.35;
+    }
+    .lanes-heading {
+      color: #555;
+      font-size: 13px;
+    }
+    .lanes-empty {
+      color: #777;
+    }
+    .lanes-list {
+      display: grid;
+      gap: 4px;
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .lanes-row {
+      display: grid;
+      grid-template-columns: minmax(96px, auto) minmax(120px, auto) auto 1fr;
+      gap: 12px;
+      margin: 0;
+    }
+    .lanes-day {
+      color: #111;
+    }
+    .lanes-time {
+      color: #111;
+    }
+    .lanes-lane {
+      color: #333;
+    }
+    .lanes-who {
+      color: #777;
+      text-align: right;
+    }
+    .lanes-source {
+      color: #777;
+      font-size: 12px;
+    }
+    .cache-chip {
+      position: absolute;
+      top: 6px;
+      right: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: #999;
+    }
+    .cache-chip-stale .cache-age {
+      color: #b26a00;
+    }
+    .cache-age {
+      font-variant-numeric: tabular-nums;
+      cursor: default;
+    }
+    .cache-refresh {
+      appearance: none;
+      background: transparent;
+      border: 1px solid #d8d8d8;
+      border-radius: 3px;
+      color: #555;
+      cursor: pointer;
+      font: inherit;
+      font-size: 11px;
+      line-height: 1;
+      padding: 2px 5px;
+    }
+    .cache-refresh:hover {
+      background: #f3f3f3;
+      color: #111;
+    }
+    .entry.run-active-search .cache-refresh {
+      opacity: 0.5;
+      pointer-events: none;
+    }
     .ai-response table {
       border-collapse: collapse;
       table-layout: auto;
@@ -1075,37 +1224,4 @@ export function renderPage(options: {
         grid-template-columns: 1fr;
       }
     }
-  </style>
-</head>
-<body>
-  <main>
-    <div id="transcript">
-      ${renderEntry({
-        query: options.query ?? "",
-        response: options.response,
-        error: options.error,
-        staticBuild: options.staticBuild
-      })}
-    </div>
-    <div class="query-row current-row">
-      <section class="current-command" data-mode="search">
-        <span class="status-label" aria-hidden="true">$0</span>
-        ${renderEffortBars(options.staticBuild ? 1 : 3, options.staticBuild ? [1] : [1, 2, 3, 4, 5])}
-        <form id="terminal-form" action="/" method="get" autocomplete="off">
-          <span class="prompt" aria-hidden="true">&gt;</span>
-          <span class="input-shell">
-            <textarea autofocus aria-label="Search" name="q" rows="1"></textarea>
-            <span class="inline-inference-highlight" aria-hidden="true"></span>
-          </span>
-          <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
-          <div class="slash-args" hidden></div>
-        </form>
-      </section>
-      <aside id="live-suggestions" class="query-suggestions live-suggestions" aria-live="polite"></aside>
-    </div>
-  </main>
-  ${options.staticBuild ? `<script>window.ZIP_CAT_STATIC = true;</script>` : ""}
-  <script type="module" src="/client.js"></script>
-</body>
-</html>`;
-}
+`;

@@ -1,4 +1,5 @@
-import type { JsonSchema, SlashCommandArgument } from "../models";
+import type { CacheDescriptor, JsonSchema, SlashCommandArgument } from "../models";
+import { MINUTE_MS } from "../cache";
 import { WeatherSlashCommand, type SlashCommandContext } from "./base";
 
 type WeatherArgs = {
@@ -219,6 +220,8 @@ export class OpenMeteoWeatherCommand extends WeatherSlashCommand<WeatherArgs, We
     widthChars: 5
   }];
   readonly outputSchema = weatherOutputSchema;
+  // Forecasts change slowly; cache per zipcode for 30 minutes.
+  readonly cache: CacheDescriptor = { ttlMs: 30 * MINUTE_MS };
 
   parseArguments(context: SlashCommandContext): WeatherArgs {
     const explicit = this.argumentValue(context, "zipcode");

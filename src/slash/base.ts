@@ -1,4 +1,5 @@
 import type {
+  CacheDescriptor,
   JsonSchema,
   SlashCommandArgument,
   SlashCommandDescriptor,
@@ -26,6 +27,10 @@ export abstract class SlashCommand<TArgs extends Record<string, unknown>, TOutpu
   abstract readonly placement: SlashCommandPlacement;
   abstract readonly outputSchema: JsonSchema;
 
+  // Optional: declare a cache TTL to make this command's output cacheable in the
+  // browser, keyed by command + args and validated against `outputSchema`.
+  readonly cache?: CacheDescriptor;
+
   protected readonly triggerPatterns: RegExp[] = [];
 
   enabled() {
@@ -40,7 +45,8 @@ export abstract class SlashCommand<TArgs extends Record<string, unknown>, TOutpu
       description: this.description,
       arguments: this.arguments,
       placement: this.placement,
-      outputSchema: this.outputSchema
+      outputSchema: this.outputSchema,
+      ...(this.cache ? { cache: this.cache } : {})
     };
   }
 
@@ -95,6 +101,14 @@ export abstract class WeatherSlashCommand<TArgs extends Record<string, unknown>,
   readonly placement: SlashCommandPlacement = {
     target: "results",
     renderer: "weather-card"
+  } as const;
+}
+
+export abstract class LanesSlashCommand<TArgs extends Record<string, unknown>, TOutput>
+  extends LookupSlashCommand<TArgs, TOutput> {
+  readonly placement: SlashCommandPlacement = {
+    target: "results",
+    renderer: "lanes-card"
   } as const;
 }
 

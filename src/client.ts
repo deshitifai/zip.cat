@@ -4,6 +4,7 @@ import { wiktionaryHeadwordPlugin } from "./plugins/wiktionaryHeadword";
 import { suggest as runLocalSuggest } from "./suggest";
 import { runSlashCommand as executeStaticSlashCommand, slashCommandDescriptors } from "./slash/registry";
 import { typedOutputDescriptors } from "./typedOutputs";
+import { type CacheHit, formatAge, readCache, writeCache } from "./cache";
 
 declare const __ZIP_CAT_STATIC_BUILD__: boolean | undefined;
 
@@ -151,9 +152,10 @@ type SlashCommandDescriptor = {
   arguments: SlashCommandArgument[];
   placement: {
     target: "results";
-    renderer: "weather-card" | "json";
+    renderer: "weather-card" | "lanes-card" | "json";
   };
   outputSchema: Record<string, unknown>;
+  cache?: { ttlMs: number };
 };
 type SlashCommandResponse = {
   commandId: string;
@@ -163,7 +165,7 @@ type SlashCommandResponse = {
   args: Record<string, unknown>;
   placement: {
     target: "results";
-    renderer: "weather-card" | "json";
+    renderer: "weather-card" | "lanes-card" | "json";
   };
   schema: Record<string, unknown>;
   output: unknown;
@@ -471,6 +473,25 @@ function debugPanelMarkup() {
   return `<div class="debug-panel" hidden></div>`;
 }
 
+// Each conversation turn is an editable user message (a reduced .entry-form so
+// the existing input wiring applies unchanged) followed by a reply body. The
+// message stays editable: resubmitting it truncates and regenerates everything
+// below. A trailing turn with an empty input and no reply is the next message.
+function turnMarkup(prompt = "") {
+  return `<div class="ai-turn">
+    <form class="entry-form thread-followup" action="/" method="get" autocomplete="off">
+      <span class="prompt" aria-hidden="true">*</span>
+      <span class="input-shell">
+        <textarea class="entry-input thread-followup-input" aria-label="Message" name="q" rows="1">${escapeHtml(prompt)}</textarea>
+        <span class="inline-inference-highlight" aria-hidden="true"></span>
+      </span>
+      <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+      <div class="slash-args" hidden></div>
+    </form>
+    <div class="ai-turn-body"></div>
+  </div>`;
+}
+
 function slashCommandControlsMarkup(command?: SlashCommandDescriptor, values: Record<string, unknown> = {}) {
   if (!command) {
     return `<div class="slash-args" hidden></div>`;
@@ -522,8 +543,7 @@ function renderEntry(
   content: string,
   mode: CommandMode = "search",
   effort: EffortLevel = 3,
-  slashArgValues: Record<string, unknown> = {},
-  threadParentId?: string
+  slashArgValues: Record<string, unknown> = {}
 ) {
   const prompt = mode === "ai" ? "*" : "&gt;";
   const slashCommand = slashCommandForQuery(query);
@@ -532,10 +552,8 @@ function renderEntry(
     : slashArgsFromInlineQuery(query, slashCommand);
   const displayQuery = slashDisplayQuery(query, slashCommand);
   const threadId = nextThreadId();
-  const threadParentAttr = threadParentId ? ` data-thread-parent="${escapeHtml(threadParentId)}"` : "";
-  const threadRowClass = threadParentId ? " query-row-thread-child" : "";
-  return `<div class="query-row${threadRowClass}" data-thread-id="${escapeHtml(threadId)}"${threadParentAttr}>
-    <section class="entry" data-mode="${mode}" data-effort="${effort}" data-thread-id="${escapeHtml(threadId)}"${threadParentAttr} data-original-query="${escapeHtml(query)}">
+  return `<div class="query-row" data-thread-id="${escapeHtml(threadId)}">
+    <section class="entry" data-mode="${mode}" data-effort="${effort}" data-thread-id="${escapeHtml(threadId)}" data-original-query="${escapeHtml(query)}">
       <span class="status-label" aria-hidden="true">$0</span>
       ${runStatusMarkup()}
       ${effortBarsMarkup(effort, mode)}
@@ -1352,11 +1370,6 @@ function focusCommandInput(searchInput: CommandField, selection = selectionForCo
   searchInput.setSelectionRange(selection.start, selection.end, selection.direction);
 }
 
-function commandModeForInput(searchInput: CommandField) {
-  const block = searchInput.closest<HTMLElement>(".entry, .current-command");
-  return block?.dataset.mode === "ai" ? "ai" : "search";
-}
-
 function isEnterKeyEvent(event: KeyboardEvent) {
   return event.key === "Enter" ||
     event.key === "Return" ||
@@ -1366,39 +1379,6 @@ function isEnterKeyEvent(event: KeyboardEvent) {
     event.which === 13;
 }
 
-function isOptionEnterEvent(event: KeyboardEvent) {
-  const optionPressed = event.altKey || event.getModifierState?.("Alt") === true;
-  return optionPressed &&
-    !event.shiftKey &&
-    !event.ctrlKey &&
-    !event.metaKey &&
-    !event.isComposing &&
-    isEnterKeyEvent(event);
-}
-
-function commandInputFromEventTarget(target: EventTarget | null) {
-  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
-    return undefined;
-  }
-
-  return target.matches('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
-    ? target
-    : undefined;
-}
-
-function submitThreadedAiInput(searchInput: CommandField, event: KeyboardEvent) {
-  if (commandModeForInput(searchInput) !== "ai") {
-    return false;
-  }
-
-  event.preventDefault();
-  event.stopPropagation();
-  if (searchInput.form) {
-    searchInput.form.dataset.threadSubmit = "true";
-    searchInput.form.requestSubmit();
-  }
-  return true;
-}
 
 function shortcutFromCode(code: string) {
   if (/^Digit[1-9]$/.test(code)) {
@@ -1567,76 +1547,36 @@ function ensureEntryThreadId(entry: HTMLElement) {
   return threadId;
 }
 
-function setEntryThreadParent(entry: HTMLElement, parentId: string) {
-  entry.dataset.threadParent = parentId;
-  const row = entryRow(entry);
-  if (row) {
-    row.dataset.threadParent = parentId;
-    row.classList.add("query-row-thread-child");
-  }
+// A conversation lives inside a single AI entry. Each completed exchange is an
+// .ai-turn block in the entry's .results: dataset.prompt holds the user prompt,
+// the inner .ai-response holds the rendered answer.
+function entryTurns(entry: HTMLElement) {
+  return Array.from(entry.querySelectorAll<HTMLElement>(".results .ai-turn"));
 }
 
-function entryForThreadId(threadId: string | undefined) {
-  if (!threadId) {
-    return undefined;
-  }
-
-  return Array.from(document.querySelectorAll<HTMLElement>(".entry"))
-    .find((entry) => entry.dataset.threadId === threadId);
+function turnResponseText(turn: HTMLElement) {
+  return turn.querySelector<HTMLElement>(".ai-response")?.innerText.trim() ?? "";
 }
 
-function aiPromptForEntry(entry: HTMLElement) {
-  const debug = debugPayloads.get(entry);
-  const debugPrompt = typeof debug?.userPrompt === "string" ? debug.userPrompt.trim() : "";
-  const originalQuery = entry.dataset.originalQuery?.trim() ?? "";
-  const inputQuery = entry.querySelector<CommandField>('textarea[name="q"], input[name="q"]')?.value.trim() ?? "";
-  return debugPrompt || originalQuery || inputQuery;
-}
-
-function aiResponseForEntry(entry: HTMLElement) {
-  const debug = debugPayloads.get(entry);
-  const apiCall = debug?.apiCall;
-  if (apiCall && typeof apiCall === "object" && !Array.isArray(apiCall)) {
-    const responseBody = (apiCall as Record<string, unknown>).responseBody;
-    if (responseBody && typeof responseBody === "object" && !Array.isArray(responseBody)) {
-      const text = (responseBody as Record<string, unknown>).text;
-      if (typeof text === "string" && text.trim()) {
-        return text.trim();
-      }
-    }
-  }
-
-  return entry.querySelector<HTMLElement>(".ai-response")?.innerText.trim() ?? "";
-}
-
-function aiThreadChain(parentEntry: HTMLElement) {
-  const chain: HTMLElement[] = [];
-  let entry: HTMLElement | undefined = parentEntry;
-  const seen = new Set<string>();
-
-  while (entry) {
-    const threadId = ensureEntryThreadId(entry);
-    if (seen.has(threadId)) {
-      break;
-    }
-    seen.add(threadId);
-    chain.unshift(entry);
-    entry = entryForThreadId(entry.dataset.threadParent);
-  }
-
-  return chain;
-}
-
-function aiThreadContext(parentEntry: HTMLElement): AiThreadContext {
-  const parentId = ensureEntryThreadId(parentEntry);
+// Context for a turn: all completed turns in this entry that come *before* the
+// one being (re)generated. When `before` is omitted, every completed turn is
+// included (a fresh follow-up at the bottom).
+function aiThreadContext(entry: HTMLElement, before?: HTMLElement): AiThreadContext {
+  const parentId = ensureEntryThreadId(entry);
+  const label = entryLabel(entry);
+  const turns = entryTurns(entry);
+  const stopAt = before ? turns.indexOf(before) : turns.length;
+  const priorTurns = stopAt === -1 ? turns : turns.slice(0, stopAt);
   return {
     parentId,
-    parentWindow: entryLabel(parentEntry),
-    turns: aiThreadChain(parentEntry).map((entry) => ({
-      window: entryLabel(entry),
-      prompt: aiPromptForEntry(entry),
-      response: aiResponseForEntry(entry)
-    }))
+    parentWindow: label,
+    turns: priorTurns
+      .map((turn) => ({
+        window: label,
+        prompt: turn.dataset.prompt?.trim() ?? "",
+        response: turnResponseText(turn)
+      }))
+      .filter((turn) => turn.prompt && turn.response)
   };
 }
 
@@ -2163,9 +2103,61 @@ function renderWeatherCard(output: unknown) {
   </section>`;
 }
 
+function renderLanesCard(output: unknown) {
+  if (!output || typeof output !== "object") {
+    return `<div class="status">No reservations.</div>`;
+  }
+
+  const lanes = output as {
+    club?: string;
+    windowDays?: number;
+    reservations?: Array<{
+      date?: string;
+      weekday?: string;
+      startTime?: string;
+      endTime?: string;
+      lane?: string;
+      who?: string;
+    }>;
+    source?: { name?: string };
+  };
+  const reservations = lanes.reservations ?? [];
+  const windowDays = typeof lanes.windowDays === "number" ? lanes.windowDays : 5;
+  const heading = `${escapeHtml(lanes.club ?? "Swim lanes")} · next ${windowDays} days`;
+
+  if (reservations.length === 0) {
+    return `<section class="lanes-card">
+      <div class="lanes-heading">${heading}</div>
+      <div class="lanes-empty">No swim-lane reservations.</div>
+      <div class="lanes-source">${escapeHtml(lanes.source?.name ?? "Clubspot")}</div>
+    </section>`;
+  }
+
+  const rows = reservations.map((reservation) => {
+    const day = [reservation.weekday, reservation.date].filter(Boolean).join(" ");
+    const time = [reservation.startTime, reservation.endTime].filter(Boolean).join("–");
+    return `<li class="lanes-row">
+      <span class="lanes-day">${escapeHtml(day || "—")}</span>
+      <span class="lanes-time">${escapeHtml(time || "—")}</span>
+      <span class="lanes-lane">${escapeHtml(reservation.lane ?? "Lane")}</span>
+      <span class="lanes-who">${escapeHtml(reservation.who ?? "")}</span>
+    </li>`;
+  }).join("");
+
+  return `<section class="lanes-card">
+    <div class="lanes-heading">${heading}</div>
+    <ul class="lanes-list">${rows}</ul>
+    <div class="lanes-source">${escapeHtml(lanes.source?.name ?? "Clubspot")}</div>
+  </section>`;
+}
+
 function renderSlashCommandOutput(payload: SlashCommandResponse) {
   if (payload.placement.renderer === "weather-card") {
     return renderWeatherCard(payload.output);
+  }
+
+  if (payload.placement.renderer === "lanes-card") {
+    return renderLanesCard(payload.output);
   }
 
   return `<pre class="slash-json">${escapeHtml(JSON.stringify(payload.output, null, 2))}</pre>`;
@@ -2281,7 +2273,7 @@ Referenced windows are provided as JSON:
 ${JSON.stringify(snapshots, null, 2)}`;
 }
 
-function resizeCommandField(searchInput: CommandField) {
+function resizeCommandField(searchInput: CommandField, deferred = false) {
   if (!(searchInput instanceof HTMLTextAreaElement)) {
     return;
   }
@@ -2304,6 +2296,12 @@ function resizeCommandField(searchInput: CommandField) {
     ?.querySelector<HTMLElement>(".inline-inference-highlight");
   if (highlight) {
     highlight.style.minHeight = `${searchInput.scrollHeight}px`;
+  }
+  // When a field is measured before layout settles (e.g. just after an entry is
+  // appended), scrollHeight can over-report and the textarea grows to several
+  // lines. Re-measure once on the next frame to correct it.
+  if (!deferred) {
+    requestAnimationFrame(() => resizeCommandField(searchInput, true));
   }
 }
 
@@ -2460,19 +2458,11 @@ function bindSuggestionInput(searchInput: CommandField) {
       return;
     }
 
-    if (isOptionEnterEvent(keyboardEvent)) {
-      submitThreadedAiInput(searchInput, keyboardEvent);
-      return;
-    }
-
     if (keyboardEvent.altKey || keyboardEvent.shiftKey) {
       return;
     }
 
     keyboardEvent.preventDefault();
-    if (searchInput.form) {
-      delete searchInput.form.dataset.threadSubmit;
-    }
     searchInput.form?.requestSubmit();
   });
   searchInput.addEventListener("input", () => {
@@ -2633,6 +2623,27 @@ document.addEventListener("mouseout", (event) => {
   setWindowReferenceTarget();
 });
 
+// Refresh button on a cached result view: re-run the command, bypassing the cache.
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const refresh = target.closest<HTMLElement>(".cache-refresh");
+  if (!refresh) {
+    return;
+  }
+  event.preventDefault();
+  const entry = refresh.closest<HTMLElement>(".entry");
+  const results = entry?.querySelector<HTMLElement>(".results");
+  const entryInput = entry?.querySelector<CommandField>(".entry-input");
+  const query = entry?.dataset.originalQuery ?? entryInput?.value ?? "";
+  if (!entry || !results || !entryInput || !query) {
+    return;
+  }
+  void runSlashCommand(query, results, entryInput, { forceRefresh: true });
+});
+
 document.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof Element)) {
@@ -2646,36 +2657,6 @@ document.addEventListener("click", (event) => {
 document.querySelectorAll<CommandField>('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
   .forEach(bindSuggestionInput);
 bindVoiceButtons();
-
-document.addEventListener("keydown", (event) => {
-  if (!isOptionEnterEvent(event)) {
-    return;
-  }
-
-  const searchInput = commandInputFromEventTarget(event.target);
-  if (!searchInput) {
-    return;
-  }
-
-  submitThreadedAiInput(searchInput, event);
-}, {
-  capture: true
-});
-
-document.addEventListener("keypress", (event) => {
-  if (!isOptionEnterEvent(event)) {
-    return;
-  }
-
-  const searchInput = commandInputFromEventTarget(event.target);
-  if (!searchInput) {
-    return;
-  }
-
-  submitThreadedAiInput(searchInput, event);
-}, {
-  capture: true
-});
 
 document.addEventListener("dblclick", (event) => {
   const target = event.target;
@@ -3256,11 +3237,158 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
   }
 }
 
-async function runSlashCommand(query: string, results: HTMLElement, searchInput: CommandField) {
+function slashCacheKey(command: SlashCommandDescriptor, args: Record<string, unknown>) {
+  const argKeys = Object.keys(args).sort();
+  const stableArgs = argKeys.map((key) => `${key}=${String(args[key] ?? "")}`).join("&");
+  return `slash:${command.command}${stableArgs ? `?${stableArgs}` : ""}`;
+}
+
+function slashCachePolicy(command: SlashCommandDescriptor, args: Record<string, unknown>) {
+  if (!command.cache) {
+    return undefined;
+  }
+  return {
+    key: slashCacheKey(command, args),
+    schema: command.outputSchema,
+    ttlMs: command.cache.ttlMs
+  };
+}
+
+// The cache age chip + refresh button shown in the upper-right of the result view.
+function cacheChipMarkup(hit: { storedAt: number; ttlMs: number } | undefined) {
+  if (!hit) {
+    return "";
+  }
+  const ageMs = Math.max(Date.now() - hit.storedAt, 0);
+  const stale = ageMs >= hit.ttlMs;
+  const label = formatAge(ageMs);
+  const title = `Updated ${label === "now" ? "just now" : `${label} ago`}${stale ? " · stale" : ""}. Click refresh to update.`;
+  return `<div class="cache-chip${stale ? " cache-chip-stale" : ""}" data-stored-at="${hit.storedAt}" data-ttl="${hit.ttlMs}">
+    <span class="cache-age" title="${escapeHtml(title)}">${escapeHtml(label)}</span>
+    <button type="button" class="cache-refresh" aria-label="Refresh" title="Refresh now">↻</button>
+  </div>`;
+}
+
+function renderCachedSlashResult(
+  results: HTMLElement,
+  payload: SlashCommandResponse,
+  hit: { storedAt: number; ttlMs: number } | undefined
+) {
+  results.innerHTML = `${cacheChipMarkup(hit)}${renderSlashCommandOutput(payload)}`;
+}
+
+// Reconstruct a render payload from cached output (no network round-trip).
+function cachedSlashPayload(
+  command: SlashCommandDescriptor,
+  query: string,
+  args: Record<string, unknown>,
+  output: unknown
+): SlashCommandResponse {
+  return {
+    commandId: command.id,
+    commandName: command.name,
+    command: command.command,
+    query,
+    args,
+    placement: command.placement,
+    schema: command.outputSchema,
+    output,
+    elapsedMs: 0
+  };
+}
+
+async function fetchSlashResult(
+  command: SlashCommandDescriptor,
+  requestBody: {
+    query: string;
+    command?: string;
+    args?: Record<string, unknown>;
+    trigger?: { type: "keyboard"; key: "Enter"; source: "search-box" };
+  },
+  results: HTMLElement
+): Promise<SlashCommandResponse & { error?: string; ok: boolean; httpStatus: number | string }> {
+  const response = staticMode
+    ? { ok: true, status: "local" as const }
+    : await fetch("/api/slash", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(requestBody)
+    });
+  const payload: SlashCommandResponse & { error?: string } = staticMode
+    ? await executeStaticSlashCommand(requestBody)
+    : await (response as Response).json() as SlashCommandResponse & { error?: string };
+
+  return { ...payload, ok: response.ok, httpStatus: response.status };
+}
+
+// Build an informative debug payload describing the command that produced this
+// window — shown on the flip side of the card. Works for both live and cached runs.
+function slashCommandDebug(
+  command: SlashCommandDescriptor,
+  query: string,
+  args: Record<string, unknown>,
+  payload: SlashCommandResponse,
+  source: { kind: "live" | "cache"; storedAt?: number; ttlMs?: number; status?: number | string }
+): DebugPayload {
+  const cache = command.cache
+    ? {
+      enabled: true,
+      ttlMs: command.cache.ttlMs,
+      servedFrom: source.kind,
+      ...(source.storedAt !== undefined
+        ? { storedAt: new Date(source.storedAt).toISOString(), ageMs: Math.max(Date.now() - source.storedAt, 0) }
+        : {})
+    }
+    : { enabled: false };
+  return {
+    kind: "slash-command",
+    command: command.command,
+    commandName: command.name,
+    query,
+    args,
+    source: source.kind,
+    elapsedMs: payload.elapsedMs,
+    cache,
+    apiCall: {
+      url: source.kind === "cache" ? "browser:cache" : staticMode ? "browser:slash-command" : "/api/slash",
+      method: source.kind === "cache" ? "cache" : staticMode ? "local" : "POST",
+      responseStatus: source.kind === "cache" ? "cache" : (source.status ?? "ok"),
+      responseBody: payload
+    },
+    outputSchema: command.outputSchema
+  };
+}
+
+async function runSlashCommand(
+  query: string,
+  results: HTMLElement,
+  searchInput: CommandField,
+  options: { forceRefresh?: boolean } = {}
+) {
   const command = slashCommandForQuery(query);
   if (!command) {
     await runSearch(query, results, normalizeEffortLevel(Number(results.closest<HTMLElement>(".entry")?.dataset.effort ?? effortLevel)));
     return;
+  }
+
+  const args = collectSlashArgs(searchInput, command);
+  const policy = slashCachePolicy(command, args);
+
+  // Serve fresh cache instantly — no network — unless the user forced a refresh.
+  if (policy && !options.forceRefresh) {
+    const cached = readCache<unknown>(policy);
+    if (cached && !cached.stale) {
+      const payload = cachedSlashPayload(command, query, args, cached.data);
+      resetRunStatus(results);
+      setRunStatus(results, "search", "done", 0, command.name);
+      setEntryDebug(results, slashCommandDebug(command, query, args, payload, {
+        kind: "cache",
+        storedAt: cached.storedAt,
+        ttlMs: cached.ttlMs
+      }));
+      renderCachedSlashResult(results, payload, cached);
+      return;
+    }
   }
 
   results.innerHTML = "";
@@ -3269,7 +3397,7 @@ async function runSlashCommand(query: string, results: HTMLElement, searchInput:
   const requestBody = {
     query,
     command: command.command,
-    args: collectSlashArgs(searchInput, command),
+    args,
     trigger: {
       type: "keyboard" as const,
       key: "Enter" as const,
@@ -3278,41 +3406,28 @@ async function runSlashCommand(query: string, results: HTMLElement, searchInput:
   };
 
   try {
-    const response = staticMode
-      ? {
-        ok: true,
-        status: "local"
-      }
-      : await fetch("/api/slash", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json"
-        },
-        body: JSON.stringify(requestBody)
-      });
-    const payload: SlashCommandResponse & { error?: string } = staticMode
-      ? await executeStaticSlashCommand(requestBody)
-      : await (response as Response).json() as SlashCommandResponse & { error?: string };
-    setEntryDebug(results, {
-      kind: "slash-command",
-      command: command.command,
-      apiCall: {
-        url: staticMode ? "browser:slash-command" : "/api/slash",
-        method: staticMode ? "local" : "POST",
-        requestBody,
-        responseStatus: response.status,
-        responseBody: payload
-      }
-    });
+    const payload = await fetchSlashResult(command, requestBody, results);
 
-    if (!response.ok) {
+    if (!payload.ok) {
       setRunStatus(results, "search", "error", payload.elapsedMs, command.name);
       results.innerHTML = `<div class="status">${escapeHtml(payload.error ?? "Slash command failed.")}</div>`;
       return;
     }
 
+    const hit: CacheHit<unknown> | undefined = policy ? writeCache(policy, payload.output) : undefined;
+
+    setEntryDebug(results, slashCommandDebug(command, query, args, payload, {
+      kind: "live",
+      status: payload.httpStatus,
+      ...(hit ? { storedAt: hit.storedAt, ttlMs: hit.ttlMs } : {})
+    }));
+
     setRunStatus(results, "search", "done", payload.elapsedMs, command.name);
-    results.innerHTML = renderSlashCommandOutput(payload);
+    renderCachedSlashResult(
+      results,
+      payload,
+      hit ?? (policy ? { storedAt: Date.now(), ttlMs: policy.ttlMs } : undefined)
+    );
   } catch (error) {
     setRunStatus(results, "search", "error");
     results.innerHTML = `<div class="status">${escapeHtml(error instanceof Error ? error.message : "Slash command failed.")}</div>`;
@@ -4352,90 +4467,64 @@ function bindVoiceButtons(root: ParentNode = document) {
   });
 }
 
-function latestAiEntry() {
-  return Array.from(document.querySelectorAll<HTMLElement>(".entry[data-mode='ai']")).at(-1);
-}
-
-function threadHasAncestor(entry: HTMLElement, ancestorId: string) {
-  let parentId = entry.dataset.threadParent;
-  const seen = new Set<string>();
-  while (parentId && !seen.has(parentId)) {
-    if (parentId === ancestorId) {
-      return true;
-    }
-    seen.add(parentId);
-    parentId = entryForThreadId(parentId)?.dataset.threadParent;
-  }
-  return false;
-}
-
-function lastThreadRow(parentEntry: HTMLElement) {
-  const parentId = ensureEntryThreadId(parentEntry);
-  let last = entryRow(parentEntry);
-  document.querySelectorAll<HTMLElement>(".entry").forEach((entry) => {
-    if (entry === parentEntry || threadHasAncestor(entry, parentId)) {
-      last = entryRow(entry) ?? last;
-    }
-  });
-  return last;
-}
-
 function nextPaint() {
   return new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve());
   });
 }
 
-function restoreParentPromptForThread(parentEntry: HTMLElement, searchInput: CommandField) {
-  const originalPrompt = aiPromptForEntry(parentEntry);
-  if (!originalPrompt || searchInput.value.trim() === originalPrompt) {
-    return;
-  }
-
-  searchInput.value = originalPrompt;
-  parentEntry.dataset.originalQuery = originalPrompt;
-  resizeCommandField(searchInput);
-  updateCommandHighlight(searchInput);
+function buildTurn(prompt = "") {
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = turnMarkup(prompt);
+  const turn = wrapper.firstElementChild as HTMLElement;
+  turn.dataset.prompt = prompt;
+  turn.querySelectorAll<CommandField>(".entry-input").forEach(bindSuggestionInput);
+  bindVoiceButtons(turn);
+  return turn;
 }
 
-async function createThreadedAiEntry(query: string, effort: EffortLevel, parentEntry?: HTMLElement) {
-  if (!transcript) {
+// Append a turn carrying `prompt` and return its reply body — the render target
+// for runAiPrompt, so streaming writes never clobber the editable message or
+// earlier turns. Once a conversation has turns, the entry's own top form is
+// hidden so the first message isn't shown twice.
+function appendAiTurn(results: HTMLElement, prompt: string) {
+  const turn = buildTurn(prompt);
+  results.append(turn);
+  results.closest<HTMLElement>(".entry")?.classList.add("ai-conversation");
+  return turn.querySelector<HTMLElement>(".ai-turn-body")!;
+}
+
+// Append an empty trailing turn (input, no reply yet) and focus it so the user
+// can keep the conversation going.
+function appendEmptyTurnInput(entry: HTMLElement) {
+  if (entry.dataset.mode !== "ai") {
     return;
   }
-
-  const parentId = parentEntry ? ensureEntryThreadId(parentEntry) : undefined;
-  const wrapper = document.createElement("div");
-  wrapper.innerHTML = renderEntry(query, "", "ai", effort, {}, parentId);
-  const node = wrapper.firstElementChild;
-  if (!(node instanceof HTMLElement)) {
-    return;
-  }
-
-  if (parentEntry && parentId) {
-    const entry = node.querySelector<HTMLElement>(".entry");
-    if (entry) {
-      setEntryThreadParent(entry, parentId);
-    }
-    lastThreadRow(parentEntry)?.after(node);
-  } else {
-    transcript.append(node);
-  }
-
-  renumberStatusLabels();
-  node.querySelectorAll<CommandField>(".entry-input").forEach(bindSuggestionInput);
-  bindVoiceButtons(node);
-
-  const results = node.querySelector<HTMLElement>(".results");
+  const results = entry.querySelector<HTMLElement>(".results");
   if (!results) {
     return;
   }
+  const existing = entry.querySelector<HTMLElement>(".ai-turn:last-child");
+  // Reuse a trailing empty turn if one is already there.
+  if (existing && !existing.querySelector(".ai-turn-body")?.textContent?.trim()
+    && !existing.querySelector<CommandField>(".entry-input")?.value.trim()) {
+    existing.querySelector<CommandField>(".entry-input")?.focus();
+    return;
+  }
+  const turn = buildTurn();
+  results.append(turn);
+  turn.querySelector<CommandField>(".entry-input")?.focus();
+}
 
-  const thread = parentEntry ? aiThreadContext(parentEntry) : undefined;
-  node.scrollIntoView({
-    block: "start"
-  });
-  await nextPaint();
-  await runAiPrompt(query, results, effort, thread);
+// Remove every turn after the given one (used when an earlier message is edited
+// and resubmitted — the conversation restarts from that point).
+function truncateTurnsAfter(turn: HTMLElement) {
+  let next = turn.nextElementSibling;
+  while (next) {
+    const toRemove = next;
+    next = next.nextElementSibling;
+    toRemove.remove();
+  }
 }
 
 document.addEventListener("submit", async (event) => {
@@ -4449,8 +4538,6 @@ document.addEventListener("submit", async (event) => {
   }
 
   event.preventDefault();
-  const isThreadSubmit = submittedForm.dataset.threadSubmit === "true";
-  delete submittedForm.dataset.threadSubmit;
 
   const searchInput = submittedForm.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
   const query = searchInput?.value.trim() ?? "";
@@ -4458,15 +4545,34 @@ document.addEventListener("submit", async (event) => {
     return;
   }
 
+  // A turn's editable message: (re)generate this turn and everything below it.
+  // This fires for follow-ups, the trailing empty input, and edits to an earlier
+  // message alike — submitting a turn always restarts the conversation from here.
+  if (submittedForm.matches(".thread-followup")) {
+    const entry = submittedForm.closest<HTMLElement>(".entry");
+    const turn = submittedForm.closest<HTMLElement>(".ai-turn");
+    const body = turn?.querySelector<HTMLElement>(".ai-turn-body");
+    if (!entry || !turn || !body) {
+      return;
+    }
+    const entryEffort = Math.min(Math.max(Number(entry.dataset.effort ?? 3), 1), 5) as EffortLevel;
+    // Context is the turns before this one; later turns are discarded.
+    const thread = aiThreadContext(entry, turn);
+    truncateTurnsAfter(turn);
+    turn.dataset.prompt = query;
+    body.innerHTML = "";
+    clearSuggestionsFor(searchInput);
+    suggestAbort?.abort();
+    await runAiPrompt(query, body, entryEffort, thread);
+    appendEmptyTurnInput(entry);
+    scrollToPrompt();
+    return;
+  }
+
   if (submittedForm.matches(".entry-form")) {
     const entry = submittedForm.closest<HTMLElement>(".entry");
     const results = entry?.querySelector<HTMLElement>(".results");
     const entryEffort = Math.min(Math.max(Number(entry?.dataset.effort ?? 3), 1), 5) as EffortLevel;
-    if (isThreadSubmit && entry?.dataset.mode === "ai") {
-      restoreParentPromptForThread(entry, searchInput);
-      await createThreadedAiEntry(query, entryEffort, entry);
-      return;
-    }
     if (results) {
       if (entry) {
         entry.dataset.originalQuery = query;
@@ -4474,7 +4580,17 @@ document.addEventListener("submit", async (event) => {
       if (slashCommandForQuery(query)) {
         await runSlashCommand(query, results, searchInput);
       } else if (entry?.dataset.mode === "ai") {
-        await runAiPrompt(query, results, entryEffort);
+        results.innerHTML = "";
+        // The conversation now owns the message as turn 1; clear the entry's own
+        // form so the first message isn't shown twice (it is hidden via CSS).
+        searchInput.value = "";
+        resizeCommandField(searchInput);
+        updateCommandHighlight(searchInput);
+        const body = appendAiTurn(results, query);
+        await runAiPrompt(query, body, entryEffort);
+        if (entry) {
+          appendEmptyTurnInput(entry);
+        }
       } else {
         await runSearch(query, results, entryEffort);
         renumberSuggestionShortcuts(searchInput);
@@ -4487,21 +4603,6 @@ document.addEventListener("submit", async (event) => {
   const submittedEffort = effortLevel;
   const submittedSlashCommand = slashCommandForQuery(query);
   const submittedSlashArgs = submittedSlashCommand ? collectSlashArgs(searchInput, submittedSlashCommand) : {};
-
-  if (isThreadSubmit && submittedMode === "ai") {
-    const parentEntry = latestAiEntry();
-    await createThreadedAiEntry(query, submittedEffort, parentEntry);
-    searchInput.value = "";
-    resizeCommandField(searchInput);
-    updateCommandHighlight(searchInput);
-    updateSlashCommandControls(searchInput);
-    clearSuggestionsFor(searchInput);
-    suggestAbort?.abort();
-    setCommandMode(submittedMode);
-    searchInput.focus();
-    scrollToPrompt();
-    return;
-  }
 
   const entry = document.createElement("div");
   entry.innerHTML = renderEntry(query, "", submittedMode, submittedEffort, submittedSlashArgs);
@@ -4532,12 +4633,25 @@ document.addEventListener("submit", async (event) => {
   scrollToPrompt();
 
   const results = node.querySelector<HTMLElement>(".results");
+  const createdEntry = node.querySelector<HTMLElement>(".entry");
   if (results) {
     const persistedInput = node.querySelector<CommandField>(".entry-input");
     if (submittedSlashCommand && persistedInput) {
       await runSlashCommand(query, results, persistedInput);
     } else if (submittedMode === "ai") {
-      await runAiPrompt(query, results, submittedEffort);
+      // The conversation owns the message as turn 1; clear the created entry's
+      // own form so the first message isn't shown twice (it is hidden via CSS).
+      const createdInput = createdEntry?.querySelector<CommandField>(".entry-form > .input-shell .entry-input");
+      if (createdInput) {
+        createdInput.value = "";
+        resizeCommandField(createdInput);
+        updateCommandHighlight(createdInput);
+      }
+      const body = appendAiTurn(results, query);
+      await runAiPrompt(query, body, submittedEffort);
+      if (createdEntry) {
+        appendEmptyTurnInput(createdEntry);
+      }
     } else {
       await runSearch(query, results, submittedEffort);
       if (persistedInput) {
