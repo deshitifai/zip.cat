@@ -4,11 +4,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --watch src/server.ts",
-    "build": "tsc --noEmit",
+    "dev": "bun scripts/dev_both.ts",
+    "dev:both": "bun scripts/dev_both.ts",
+    "dev:server": "bun --watch src/server.ts",
+    "eval:inline": "bun scripts/eval_inline_substitutions.ts",
+    "eval:inline:openrouter": "bun scripts/eval_inline_substitutions.ts --models openrouter:openai/gpt-4.1-mini",
+    "eval:inline:local": "bun scripts/eval_inline_substitutions.ts --models local-gemma-node",
+    "build": "tsc --noEmit && bun run build:static",
+    "build:static": "bun scripts/build_static.ts",
     "start": "bun src/server.ts"
   },
   "dependencies": {
+    "@huggingface/transformers": "3.7.1",
     "dotenv": "^17.2.3",
     "elysia": "^1.4.28",
     "exa-js": "^2.13.0",

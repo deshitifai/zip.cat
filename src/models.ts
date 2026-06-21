@@ -10,9 +10,25 @@ export interface SuggestRequest {
   trigger?: SuggestTrigger;
 }
 
+export interface AiChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
 export interface AiRequest {
   prompt: string;
+  messages?: AiChatMessage[];
   effort?: number;
+  outputSchemaId?: string;
+  trigger?: SearchTrigger;
+}
+
+export interface SearchShapeRequest {
+  prompt: string;
+  searchQuery: string;
+  results: SearchResult[];
+  effort?: number;
+  outputSchemaId: string;
   trigger?: SearchTrigger;
 }
 
@@ -124,9 +140,49 @@ export interface AiResponse {
   text: string;
   model: string;
   provider: string;
+  typedOutput?: TypedOutputResult;
   usage?: Record<string, unknown>;
   debug?: Record<string, unknown>;
   elapsedMs: number;
+}
+
+export interface SearchShapeResponse {
+  prompt: string;
+  searchQuery: string;
+  resultCount: number;
+  text: string;
+  model: string;
+  provider: string;
+  typedOutput: TypedOutputResult;
+  usage?: Record<string, unknown>;
+  debug?: Record<string, unknown>;
+  elapsedMs: number;
+}
+
+export type TypedOutputRenderer = "markdown" | "boolean" | "restaurant-card" | "restaurant-list" | "json";
+
+export interface TypedOutputDescriptor {
+  id: string;
+  marker: `#${string}`;
+  name: string;
+  label: string;
+  description: string;
+  renderer: TypedOutputRenderer;
+  schema: JsonSchema;
+}
+
+export interface TypedOutputRef {
+  id: string;
+  marker: `#${string}`;
+  name: string;
+  start: number;
+  end: number;
+}
+
+export interface TypedOutputResult {
+  descriptor: TypedOutputDescriptor;
+  value: unknown;
+  rawText: string;
 }
 
 export type SlashArgumentType = "text" | "number" | "boolean" | "choice";

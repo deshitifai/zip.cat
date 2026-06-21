@@ -1,4 +1,4 @@
-import type { EffortLevel, SearchResult } from "../models";
+import type { AiChatMessage, EffortLevel, JsonSchema, SearchResult } from "../models";
 
 export type GeneratorKind = "web-search" | "ai";
 
@@ -21,6 +21,12 @@ export interface WebSearchRequest {
 
 export interface AiGenerateRequest {
   prompt: string;
+  messages?: AiChatMessage[];
+  system?: string;
+  responseSchema?: {
+    name: string;
+    schema: JsonSchema;
+  };
 }
 
 export abstract class ResultGenerator<TRequest, TResult> {

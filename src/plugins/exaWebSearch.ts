@@ -1,5 +1,5 @@
 import type { JsonSchema, SearchPlugin } from "../models";
-import { createExaWebSearchGenerators, exaWebSearchGeneratorForEffort } from "../generators/exa";
+import { createWebSearchGenerators, webSearchGeneratorForEffort } from "../generators/webSearch";
 
 export const exaWebSearchResultSchema = {
   type: "object",
@@ -16,8 +16,7 @@ export const exaWebSearchResultSchema = {
       type: "number"
     },
     provider: {
-      type: "string",
-      const: "exa.web-search"
+      type: "string"
     }
   }
 } satisfies JsonSchema;
@@ -30,10 +29,10 @@ export function exaWebSearchPlugin(): SearchPlugin {
 
   return {
     id: "exa.web-search",
-    name: "Exa.ai Web Search",
+    name: "Web Search",
     resultPlacement,
     resultsSchema: exaWebSearchResultSchema,
-    enabled: () => createExaWebSearchGenerators().some((generator) => generator.enabled()),
+    enabled: () => createWebSearchGenerators().some((generator) => generator.enabled()),
     triggerQualify(context) {
       const isSearchBoxReturn =
         context.request.trigger.type === "keyboard" &&
@@ -42,22 +41,34 @@ export function exaWebSearchPlugin(): SearchPlugin {
 
       return {
         qualified: isSearchBoxReturn && context.request.query.length > 0,
-        reason: isSearchBoxReturn ? undefined : "Exa web search only fires from Return in the search box."
+        reason: isSearchBoxReturn ? undefined : "Web search only fires from Return in the search box."
       };
     },
     async triggerExecute(context) {
-      const generator = exaWebSearchGeneratorForEffort(context.request.effort);
-      const results = await generator.execute({
-        query: context.request.query,
-        limit: context.request.limit
-      });
+      const generator = webSearchGeneratorForEffort(context.request.effort);
+      try {
+        const results = await generator.execute({
+          query: context.request.query,
+          limit: context.request.limit
+        });
 
-      return {
-        pluginId: generator.id,
-        placement: resultPlacement,
-        schema: exaWebSearchResultSchema,
-        results
-      };
+        return {
+          pluginId: generator.id,
+          placement: resultPlacement,
+          schema: exaWebSearchResultSchema,
+          results
+        };
+      } catch (error) {
+        console.error("[search] generator failed", {
+          generatorId: generator.id,
+          provider: generator.provider,
+          effort: context.request.effort,
+          query: context.request.query,
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined
+        });
+        throw error;
+      }
     }
   };
 }
