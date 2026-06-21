@@ -1,122 +1,248 @@
 # zip.cat
 
-zip.cat is a minimal terminal-style search interface with two command modes:
+Terminal search. One prompt, no chrome.
 
-- `>` runs web search.
-- `*` runs an AI prompt.
+`>` searches. `*` asks AI. Results stay in editable windows named `$0`, `$1`,
+`$2`, ...
 
-The UI is intentionally sparse: one command line, a transcript of prior commands,
-right-side suggestion plugins, and keyboard shortcuts for opening results quickly.
+![Empty zip.cat prompt](docs/images/zipcat-empty.jpg)
 
-![zip.cat search results](docs/images/search-results.jpg)
-
-## Features
-
-- Fast web search through Exa.
-- AI answers through OpenRouter.
-- Five effort levels that select concrete generator classes, not just numeric
-  options.
-- Wikipedia and Wiktionary sidebar suggestions while typing.
-- Markdown rendering for AI responses.
-- Option shortcuts for opening search results, sidebar suggestions, and AI links.
-- Editable command history: move back to earlier commands, edit them, and rerun.
-- Compact terminal UI with persistent result blocks.
-
-## Stack
-
-- Runtime: Bun
-- Server: Elysia
-- Language: TypeScript
-- Search provider: Exa
-- AI provider: OpenRouter
-- Markdown parser: marked
-
-## Getting Started
-
-Install dependencies:
+## Run
 
 ```sh
 bun install
-```
-
-Create a local `.env` file or use the shared key file loaded by the app. Required
-keys:
-
-```sh
-EXA_API_KEY=...
-OPENROUTER_API_KEY=...
-```
-
-Run the development server:
-
-```sh
 bun run dev
 ```
 
 Open:
 
-```text
-http://localhost:3000
-```
+- dynamic app: `http://localhost:3000`
+- static-only app: `http://localhost:3001`
 
-Type-check:
+`bun run dev` serves both and rebuilds the static site on file changes. The user
+normally runs this server locally.
+
+Build:
 
 ```sh
 bun run build
 ```
 
-## Effort Generators
+Static output is written to `dist/static`.
 
-Effort is treated as generator selection. Each level maps to a concrete web
-search generator or AI generator.
+## Keys
 
-### Web Search
-
-| Effort | Generator | Exa type | Results |
-| --- | --- | --- | --- |
-| 1 | `ExaInstantWebSearchGenerator` | `instant` | 4 |
-| 2 | `ExaFastWebSearchGenerator` | `fast` | 8 |
-| 3 | `ExaAutoWebSearchGenerator` | `auto` | 12 |
-| 4 | `ExaDeepLiteWebSearchGenerator` | `deep-lite` | 20 |
-| 5 | `ExaDeepWebSearchGenerator` | `deep` | 30 |
-
-### AI
-
-| Effort | Generator | Model |
-| --- | --- | --- |
-| 1 | `OpenRouterGpt41NanoGenerator` | `openai/gpt-4.1-nano` |
-| 2 | `OpenRouterGpt41MiniGenerator` | `openai/gpt-4.1-mini` |
-| 3 | `OpenRouterAutoGenerator` | `openrouter/auto` |
-| 4 | `OpenRouterGpt41Generator` | `openai/gpt-4.1` |
-| 5 | `OpenRouterGpt55Generator` | `openai/gpt-5.5-20260423` |
-
-OpenRouter models can be overridden with:
+Server mode reads env from `.env`, `~/cats/.env`, and
+`~/projects/cats/.env`.
 
 ```sh
-AI_MODEL_EFFORT_1=...
-AI_MODEL_EFFORT_2=...
-AI_MODEL_EFFORT_3=...
-AI_MODEL_EFFORT_4=...
-AI_MODEL_EFFORT_5=...
+EXA_API_KEY=...
+SERP_API_KEY=...
+OPENROUTER_API_KEY=...
 ```
 
-## Project Structure
+Optional local/server voice:
+
+```sh
+pip install moonshine-voice
+```
+
+Static mode includes no secrets.
+
+## Search
+
+Type at `>` and press `Enter`.
+
+![Search with sidebar suggestions](docs/images/zipcat-search.jpg)
+
+Search effort:
+
+| Level | Generator |
+| --- | --- |
+| 1 | DuckDuckGo Instant Answer in static/local mode; Exa Instant in server mode |
+| 2 | Exa Fast |
+| 3 | Exa Auto |
+| 4 | Exa Deep Lite |
+| 5 | SerpAPI Google Search |
+
+Search supports:
+
+- URL/title result rows
+- favicons
+- no result separators
+- Option shortcuts for opening results
+- sidebar Wikipedia title match
+- sidebar Wiktionary headword + definition
+- inline AI substitutions with `*(...)`
+
+Example:
 
 ```text
-src/
-  ai.ts                       AI request entry point
-  client.ts                   Browser UI and keyboard behavior
-  generators/
-    base.ts                   Generic generator abstractions
-    exa.ts                    Exa web search generator hierarchy
-    openRouter.ts             OpenRouter AI generator hierarchy
-  plugins/
-    exaWebSearch.ts           Search plugin wrapper around Exa generators
-    wikipediaTitle.ts         Wikipedia sidebar suggestion plugin
-    wiktionaryHeadword.ts     Wiktionary sidebar suggestion plugin
-  render.ts                   Server-rendered HTML and CSS
-  search.ts                   Search orchestration
-  server.ts                   Elysia server and API routes
+> things to do in *(capital of france)
 ```
 
-See [USER_GUIDE.md](USER_GUIDE.md) for keyboard controls and workflows.
+The `*(...)` spans resolve first, then the rewritten query runs.
+
+## AI
+
+Switch to `*`, type a prompt, press `Enter`.
+
+Toggle mode with:
+
+- `Right Arrow` at the end of an input
+- `Left Arrow` at the start of an input
+
+AI supports:
+
+- Markdown rendering
+- link shortcuts with Option
+- OpenRouter server models
+- local browser Gemma in static/local mode
+- model loading progress
+- threaded conversations
+
+Threaded AI:
+
+- `Option-Enter` in `*` mode creates a linked follow-up window.
+- `Shift-Enter` inserts a newline.
+- Threaded server calls send prior turns as chat messages when the provider
+  supports that shape.
+
+![AI mode and typed output marker](docs/images/zipcat-ai-typed-output.jpg)
+
+## Typed Outputs
+
+Put a schema marker anywhere in an AI/search request.
+
+```text
+* dogs have legs #bool
+> best ice cream fairfax ca #Restaurant
+> ice cream shops marin county #Restaurant[]
+```
+
+Current schemas:
+
+- `#bool`: renders `True` or `False`
+- `#Restaurant`: renders a place/entity card
+- `#Restaurant[]`: renders a list of place/entity cards
+
+Restaurant entities are place records, not prose answers. They prefer concrete
+fields such as name, category, address, phone, website, rating, and map query.
+
+Type `#R` then `Tab` to accept the schema ghost text.
+
+## Slash Commands
+
+Slash commands are modular functions with arguments and typed result renderers.
+
+Current command:
+
+```text
+> /weather 94930
+```
+
+It uses Open-Meteo and renders current conditions plus a short forecast.
+
+![Weather slash command](docs/images/zipcat-weather.jpg)
+
+Type `/` at the start of the prompt to see command ghost text. `Tab` accepts a
+suggestion. Wikipedia/Wiktionary suggestions are disabled for slash commands.
+
+## Voice
+
+Use the dot button or `Option-Space`.
+
+- click dot: start/stop voice input
+- double-click dot: choose voice engine
+- static mode: browser Moonshine only
+- server mode: browser Moonshine or Python Moonshine stream
+
+The input keeps focus while toggling voice. Browser Moonshine preloads on page
+load in static/local mode.
+
+## Window References
+
+Each window gets a label: `$0`, `$1`, ...
+
+Use labels in AI prompts:
+
+```text
+* summarize $0
+* pick the best result from $2
+```
+
+References become pills. Hovering a pill highlights the referenced window.
+Referenced data is sent to AI as structured JSON with result kind and raw result
+data when available.
+
+## Shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Enter` | Run current prompt |
+| `Shift-Enter` | Newline |
+| `Option-Enter` | Threaded AI follow-up |
+| `Left Arrow` at start | Toggle `>` / `*` |
+| `Right Arrow` at end | Toggle `>` / `*` |
+| `Up Arrow` | Focus previous command window |
+| `Down Arrow` | Focus next command window |
+| `Option-Up` | Increase focused window effort |
+| `Option-Down` | Decrease focused window effort |
+| hold `Option` | Show open shortcuts |
+| `Option` + shown key | Open result/suggestion/link in a new tab |
+| `Option-Space` | Toggle voice |
+| `Command-K` | Clear old windows, keep current input |
+| double-click window | Flip debug panel |
+
+## Debug
+
+Double-click a result window to flip it.
+
+Debug data includes:
+
+- user query
+- resolved `*(...)` query
+- search query
+- search API call and response
+- typed-output shaping call
+- model prompt used for shaping
+- model/provider response JSON
+
+Server failures log route, query, effort, provider/generator, error, and stack in
+the server console. Secrets are not logged.
+
+## Static Mode
+
+Static mode is built for key-free local/browser use:
+
+- DuckDuckGo Instant Answer API
+- Wikipedia/Wiktionary browser suggestions
+- `/weather`
+- browser Moonshine
+- browser Gemma
+- no Exa/OpenRouter/SerpAPI keys
+
+Serve it locally with:
+
+```sh
+bun run dev
+# open http://localhost:3001
+```
+
+Or build only:
+
+```sh
+bun run build:static
+```
+
+## Evals
+
+Inline substitution evals live in `evals/`.
+
+```sh
+bun run eval:inline
+bun run eval:inline:openrouter
+bun run eval:inline:local
+```
+
+Local Gemma evals require a runtime with WebGPU.

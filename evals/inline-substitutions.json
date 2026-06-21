@@ -1,0 +1,69 @@
+{
+  "$schema": "./inline-substitutions.schema.json",
+  "cases": [
+    {
+      "id": "capital-france-leading",
+      "category": "fact",
+      "query": "*(capital of france) fun things to do",
+      "spans": ["capital of france"],
+      "expectedSubstitutions": [["paris"]],
+      "expectedResolvedQuery": "paris fun things to do"
+    },
+    {
+      "id": "capital-france-middle",
+      "category": "fact",
+      "query": "best croissant in *(capital of france)",
+      "spans": ["capital of france"],
+      "expectedSubstitutions": [["paris"]],
+      "expectedResolvedQuery": "best croissant in paris"
+    },
+    {
+      "id": "largest-us-state",
+      "category": "fact",
+      "query": "national parks in *(largest US state by area)",
+      "spans": ["largest US state by area"],
+      "expectedSubstitutions": [["alaska"]],
+      "expectedResolvedQuery": "national parks in alaska"
+    },
+    {
+      "id": "chemical-symbol-water",
+      "category": "fact",
+      "query": "safety data for *(chemical formula for water)",
+      "spans": ["chemical formula for water"],
+      "expectedSubstitutions": [["H2O", "h2o"]],
+      "expectedResolvedQuery": "safety data for h2o"
+    },
+    {
+      "id": "two-substitutions",
+      "category": "multi",
+      "query": "flights from *(airport code for San Francisco) to *(airport code for New York JFK)",
+      "spans": ["airport code for San Francisco", "airport code for New York JFK"],
+      "expectedSubstitutions": [["SFO", "sfo"], ["JFK", "jfk"]],
+      "expectedResolvedQuery": "flights from sfo to jfk"
+    },
+    {
+      "id": "date-independent-history",
+      "category": "fact",
+      "query": "museums about *(first US president)",
+      "spans": ["first US president"],
+      "expectedSubstitutions": [["George Washington", "washington"]],
+      "expectedResolvedQuery": "museums about george washington"
+    },
+    {
+      "id": "unit-conversion",
+      "category": "format",
+      "query": "running pace for *(10 kilometers in miles)",
+      "spans": ["10 kilometers in miles"],
+      "expectedSubstitutions": [["6.2 miles", "6.21 miles", "6.214 miles"]],
+      "expectedResolvedQuery": "running pace for 6.2 miles"
+    },
+    {
+      "id": "json-discipline",
+      "category": "format",
+      "query": "restaurants near *(zip code for Fairfax California)",
+      "spans": ["zip code for Fairfax California"],
+      "expectedSubstitutions": [["94930"]],
+      "expectedResolvedQuery": "restaurants near 94930"
+    }
+  ]
+}

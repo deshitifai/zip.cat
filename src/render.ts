@@ -2,9 +2,22 @@ import type { SearchResponse } from "./models";
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
 
-function renderEffortBars(effort = 3) {
-  return `<span class="effort-bars" data-effort="${effort}" aria-label="Effort ${effort} of 5" title="Effort ${effort} of 5">${[1, 2, 3, 4, 5]
-    .map((level) => `<span class="effort-bar${level <= effort ? " active" : ""}" data-effort-level="${level}" title="Effort ${level} of 5" aria-hidden="true"></span>`)
+function renderEffortBars(effort = 3, levels = [1, 2, 3, 4, 5]) {
+  const available = new Set(levels);
+  const label = levels.length === 1 ? "DuckDuckGo Instant Answer" : `Effort ${effort} of 5`;
+  return `<span class="effort-bars" data-effort="${effort}" aria-label="${label}" title="${label}">${[1, 2, 3, 4, 5]
+    .map((level) => {
+      const isAvailable = available.has(level);
+      const classes = [
+        "effort-bar",
+        isAvailable && level <= effort ? "active" : "",
+        isAvailable ? "" : "unavailable"
+      ].filter(Boolean).join(" ");
+      const title = isAvailable
+        ? levels.length === 1 ? label : `Effort ${level} of 5`
+        : `Level ${level} is not configured`;
+      return `<span class="${classes}" data-effort-level="${level}" title="${title}" aria-hidden="true"></span>`;
+    })
     .join("")}</span>`;
 }
 
@@ -58,6 +71,7 @@ function renderEntry(options: {
   query: string;
   response?: SearchResponse;
   error?: string;
+  staticBuild?: boolean;
 }) {
   if (!options.query.trim()) {
     return "";
@@ -68,16 +82,20 @@ function renderEntry(options: {
     ? `<div class="status">${escapeHtml(options.error)}</div>`
     : "";
 
+  const effort = options.staticBuild ? 1 : 3;
+  const levels = options.staticBuild ? [1] : [1, 2, 3, 4, 5];
+
   return `<div class="query-row">
-    <section class="entry" data-mode="search" data-effort="3">
+    <section class="entry" data-mode="search" data-effort="${effort}">
       <span class="status-label" aria-hidden="true">$0</span>
-      ${renderEffortBars(3)}
+      ${renderEffortBars(effort, levels)}
       <form class="entry-form" action="/" method="get" autocomplete="off">
         <span class="prompt" aria-hidden="true">&gt;</span>
         <span class="input-shell">
           <textarea class="entry-input" aria-label="Previous search" name="q" rows="1">${query}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
+        <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
         <div class="slash-args" hidden></div>
       </form>
       <div class="results">
@@ -94,9 +112,10 @@ export function renderPage(options: {
   query?: string;
   response?: SearchResponse;
   error?: string;
+  staticBuild?: boolean;
 }) {
   return `<!doctype html>
-<html lang="en">
+<html lang="en"${options.staticBuild ? ` data-zip-static="true"` : ""}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -120,17 +139,27 @@ export function renderPage(options: {
       gap: 22px;
       align-items: start;
     }
+    .query-row-thread-child .entry::after {
+      content: "";
+      position: absolute;
+      left: 22px;
+      top: -19px;
+      height: 18px;
+      border-left: 1px solid #aaa;
+      pointer-events: none;
+      z-index: 1;
+    }
     .line,
     form {
       display: grid;
-      grid-template-columns: auto minmax(0, 1fr);
+      grid-template-columns: auto minmax(0, 1fr) auto;
       align-items: start;
       column-gap: 8px;
       width: 100%;
     }
     .entry-form:has(.slash-args:not([hidden])),
     #terminal-form:has(.slash-args:not([hidden])) {
-      grid-template-columns: auto max-content minmax(120px, 220px) minmax(0, 1fr);
+      grid-template-columns: auto max-content minmax(120px, 220px) auto minmax(0, 1fr);
     }
     .entry {
       border: 1px solid #d8d8d8;
@@ -205,6 +234,11 @@ export function renderPage(options: {
     .effort-bar.active {
       background: #111;
       border-color: #111;
+    }
+    .effort-bar.unavailable {
+      background: transparent;
+      border-color: #cfcfcf;
+      opacity: 0.35;
     }
     .effort-menu {
       background: #fff;
@@ -292,6 +326,65 @@ export function renderPage(options: {
       animation: none;
       color: #b00020;
     }
+    .model-load-progress {
+      left: 72px;
+      position: absolute;
+      right: 176px;
+      top: 4px;
+      z-index: 2;
+    }
+    .model-progress {
+      color: #555;
+      display: grid;
+      font-size: 11px;
+      gap: 3px;
+      line-height: 13px;
+      min-width: 0;
+    }
+    .model-progress-row {
+      align-items: baseline;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+      min-width: 0;
+      white-space: nowrap;
+    }
+    .model-progress-row span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .model-progress-row span:last-child {
+      color: #777;
+      flex: none;
+    }
+    .model-progress-track {
+      background: #ececec;
+      height: 2px;
+      overflow: hidden;
+      position: relative;
+      width: 100%;
+    }
+    .model-progress-track span {
+      background: #111;
+      display: block;
+      height: 100%;
+      min-width: 2px;
+      transition: width 160ms linear;
+    }
+    .model-progress-ready .model-progress-track span {
+      background: #128a33;
+      width: 100% !important;
+    }
+    .model-progress-error .model-progress-track span {
+      background: #b00020;
+      width: 100% !important;
+    }
+    .model-progress.indeterminate .model-progress-track span {
+      animation: model-progress-indeterminate 900ms ease-in-out infinite;
+      min-width: 30%;
+      position: absolute;
+      width: 30% !important;
+    }
     @keyframes ai-phase-pulse {
       0%, 100% { color: #ff4d00; }
       20% { color: #ffcc00; }
@@ -333,6 +426,10 @@ export function renderPage(options: {
       40% { border-top-color: #00d084; }
       60% { border-top-color: #b6f500; }
       80% { border-top-color: #009a44; }
+    }
+    @keyframes model-progress-indeterminate {
+      0% { left: -30%; }
+      100% { left: 100%; }
     }
     .prompt {
       font-size: 15px;
@@ -386,6 +483,75 @@ export function renderPage(options: {
       position: relative;
       z-index: 1;
     }
+    .voice-button {
+      appearance: none;
+      background: transparent;
+      border: 0;
+      color: #777;
+      cursor: pointer;
+      display: block;
+      font: inherit;
+      font-size: 11px;
+      grid-column: 3;
+      grid-row: 1;
+      height: 24px;
+      line-height: 24px;
+      margin: 0;
+      padding: 0 2px;
+      text-align: center;
+      width: 16px;
+    }
+    .voice-button:hover,
+    .voice-button.recording {
+      color: #111;
+    }
+    .voice-button.recording {
+      animation: ai-phase-pulse 620ms linear infinite;
+    }
+    .voice-button.transcribing {
+      animation: search-phase-pulse 620ms linear infinite;
+    }
+    .voice-button.error {
+      color: #b00020;
+    }
+    .voice-menu {
+      background: #fff;
+      border: 1px solid #111;
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
+      display: grid;
+      gap: 0;
+      min-width: 280px;
+      padding: 4px;
+      position: fixed;
+      z-index: 30;
+    }
+    .voice-menu button {
+      appearance: none;
+      background: #fff;
+      border: 0;
+      color: #111;
+      cursor: pointer;
+      display: grid;
+      font: inherit;
+      font-size: 13px;
+      gap: 2px;
+      grid-template-columns: 70px minmax(0, 1fr);
+      line-height: 1.25;
+      padding: 7px 8px;
+      text-align: left;
+    }
+    .voice-menu button:hover,
+    .voice-menu button.active {
+      background: #f2f2f2;
+    }
+    .voice-menu span + span {
+      color: #555;
+      font-size: 12px;
+    }
+    .entry-form:has(.slash-args:not([hidden])) .voice-button,
+    #terminal-form:has(.slash-args:not([hidden])) .voice-button {
+      grid-column: 4;
+    }
     .entry-form:has(.slash-args:not([hidden])) .input-shell,
     #terminal-form:has(.slash-args:not([hidden])) .input-shell,
     .entry-form:has(.slash-args:not([hidden])) .entry-input,
@@ -401,7 +567,7 @@ export function renderPage(options: {
       inset: 0;
       letter-spacing: 0;
       line-height: 24px;
-      overflow: hidden;
+      overflow: visible;
       overflow-wrap: anywhere;
       pointer-events: none;
       position: absolute;
@@ -439,12 +605,26 @@ export function renderPage(options: {
     }
     .window-ref-pill {
       background: #f3f3f3;
-      border: 1px solid #bdbdbd;
+      border: 0;
+      box-shadow: inset 0 0 0 1px #bdbdbd;
       color: #111;
-      display: inline-block;
-      line-height: 18px;
-      padding: 0 4px;
+      display: inline;
+      font: inherit;
+      line-height: inherit;
+      padding: 0;
       pointer-events: auto;
+      vertical-align: baseline;
+    }
+    .typed-output-pill {
+      background: #f8f8f8;
+      border: 0;
+      color: #111;
+      display: inline;
+      font: inherit;
+      line-height: inherit;
+      outline: 1px solid #111;
+      outline-offset: 2px;
+      padding: 0;
       vertical-align: baseline;
     }
     .entry.window-reference-target,
@@ -625,6 +805,78 @@ export function renderPage(options: {
       display: block;
     }
     .status, .meta { color: #555; font-size: 13px; }
+    .typed-response {
+      display: grid;
+      gap: 10px;
+    }
+    .typed-bool {
+      font-size: 15px;
+      line-height: 19px;
+    }
+    .restaurant-list {
+      display: grid;
+      gap: 12px;
+    }
+    .restaurant-card {
+      border: 1px solid #d8d8d8;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(0, 1fr) 132px;
+      padding: 10px;
+    }
+    .restaurant-card h3 {
+      font-size: 15px;
+      font-weight: 400;
+      line-height: 19px;
+      margin: 0;
+    }
+    .restaurant-card p {
+      margin: 4px 0 0;
+    }
+    .restaurant-meta,
+    .restaurant-address {
+      color: #666;
+      font-size: 13px;
+      line-height: 18px;
+    }
+    .restaurant-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .restaurant-actions a {
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .restaurant-map {
+      align-items: center;
+      border: 1px solid #d8d8d8;
+      color: #666;
+      display: flex;
+      font-size: 13px;
+      justify-content: center;
+      min-height: 92px;
+      padding: 8px;
+      text-align: center;
+    }
+    .restaurant-map:hover {
+      border-color: #111;
+      color: #111;
+      text-decoration: none;
+    }
+    .typed-json {
+      background: #f7f7f7;
+      border: 1px solid #d8d8d8;
+      color: #111;
+      font: inherit;
+      font-size: 12px;
+      line-height: 1.35;
+      margin: 0;
+      overflow: auto;
+      padding: 8px;
+      white-space: pre;
+    }
     .meta { margin-bottom: 8px; padding-left: 2px; }
     .ai-response {
       font-size: 15px;
@@ -818,7 +1070,8 @@ export function renderPage(options: {
         margin-top: 8px;
       }
       .weather-metrics,
-      .weather-day {
+      .weather-day,
+      .restaurant-card {
         grid-template-columns: 1fr;
       }
     }
@@ -830,25 +1083,28 @@ export function renderPage(options: {
       ${renderEntry({
         query: options.query ?? "",
         response: options.response,
-        error: options.error
+        error: options.error,
+        staticBuild: options.staticBuild
       })}
     </div>
     <div class="query-row current-row">
       <section class="current-command" data-mode="search">
         <span class="status-label" aria-hidden="true">$0</span>
-        ${renderEffortBars(3)}
+        ${renderEffortBars(options.staticBuild ? 1 : 3, options.staticBuild ? [1] : [1, 2, 3, 4, 5])}
         <form id="terminal-form" action="/" method="get" autocomplete="off">
           <span class="prompt" aria-hidden="true">&gt;</span>
           <span class="input-shell">
             <textarea autofocus aria-label="Search" name="q" rows="1"></textarea>
             <span class="inline-inference-highlight" aria-hidden="true"></span>
           </span>
+          <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
           <div class="slash-args" hidden></div>
         </form>
       </section>
       <aside id="live-suggestions" class="query-suggestions live-suggestions" aria-live="polite"></aside>
     </div>
   </main>
+  ${options.staticBuild ? `<script>window.ZIP_CAT_STATIC = true;</script>` : ""}
   <script type="module" src="/client.js"></script>
 </body>
 </html>`;

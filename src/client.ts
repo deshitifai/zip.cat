@@ -1,12 +1,30 @@
 import { marked } from "marked";
+import { wikipediaTitlePlugin } from "./plugins/wikipediaTitle";
+import { wiktionaryHeadwordPlugin } from "./plugins/wiktionaryHeadword";
+import { suggest as runLocalSuggest } from "./suggest";
+import { runSlashCommand as executeStaticSlashCommand, slashCommandDescriptors } from "./slash/registry";
+import { typedOutputDescriptors } from "./typedOutputs";
+
+declare const __ZIP_CAT_STATIC_BUILD__: boolean | undefined;
 
 type SearchResult = {
   title?: string;
   url: string;
+  provider?: string;
 };
 
 type SearchResponse = {
+  query?: string;
   results: SearchResult[];
+  resultSets?: Array<{
+    pluginId: string;
+    placement: {
+      target: "results";
+      renderer: "url-table";
+    };
+    schema: Record<string, unknown>;
+    results: SearchResult[];
+  }>;
   elapsedMs: number;
 };
 
@@ -26,9 +44,24 @@ type AiResponse = {
   text: string;
   model: string;
   provider: string;
+  typedOutput?: TypedOutputResult;
   usage?: Record<string, unknown>;
   debug?: Record<string, unknown>;
   elapsedMs: number;
+};
+
+type SearchShapeResponse = {
+  prompt: string;
+  searchQuery: string;
+  resultCount: number;
+  text: string;
+  model: string;
+  provider: string;
+  typedOutput: TypedOutputResult;
+  usage?: Record<string, unknown>;
+  debug?: Record<string, unknown>;
+  elapsedMs: number;
+  error?: string;
 };
 
 type InlineInferenceResponse = {
@@ -41,15 +74,38 @@ type InlineInferenceResponse = {
   elapsedMs: number;
   error?: string;
 };
+type VoiceTranscriptionResponse = {
+  text: string;
+  model: "moonshine";
+  provider: "moonshine.ai";
+  elapsedMs: number;
+  error?: string;
+};
 
 type CommandMode = "search" | "ai";
 type CommandField = HTMLInputElement | HTMLTextAreaElement;
 type EffortLevel = 1 | 2 | 3 | 4 | 5;
+type VoiceEngine = "server" | "browser";
+type AiEngine = "openrouter" | "browser-gemma";
 type EffortContext = {
   bars: HTMLElement;
   entry?: HTMLElement;
   effort: EffortLevel;
   mode: CommandMode;
+};
+type AiThreadTurn = {
+  window: string;
+  prompt: string;
+  response: string;
+};
+type AiThreadContext = {
+  parentId: string;
+  parentWindow: string;
+  turns: AiThreadTurn[];
+};
+type AiChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
 };
 type DebugPayload = Record<string, unknown>;
 type GeneratorDescriptor = {
@@ -115,8 +171,56 @@ type SlashCommandResponse = {
   debug?: Record<string, unknown>;
   error?: string;
 };
+type TypedOutputRenderer = "markdown" | "boolean" | "restaurant-card" | "restaurant-list" | "json";
+type TypedOutputDescriptor = {
+  id: string;
+  marker: `#${string}`;
+  name: string;
+  label: string;
+  description: string;
+  renderer: TypedOutputRenderer;
+  schema: Record<string, unknown>;
+};
+type TypedOutputResult = {
+  descriptor: TypedOutputDescriptor;
+  value: unknown;
+  rawText: string;
+};
+type VoiceRecorderState = {
+  engine: VoiceEngine;
+  button: HTMLButtonElement;
+  input: CommandField;
+  stream: MediaStream;
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  captureNode: AudioNode;
+  socket?: WebSocket;
+  worker?: Worker;
+  pendingPcm: Int16Array[];
+  flushInterval: number;
+  insertStart: number;
+  insertEnd: number;
+  timeout: number;
+};
+type CommandSelection = {
+  start: number;
+  end: number;
+  direction: "forward" | "backward" | "none";
+};
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
+const allEffortLevels = [1, 2, 3, 4, 5] as EffortLevel[];
+const staticBuild = typeof __ZIP_CAT_STATIC_BUILD__ !== "undefined" && __ZIP_CAT_STATIC_BUILD__;
+const staticMode = staticBuild ||
+  document.documentElement.dataset.zipStatic === "true" ||
+  (window as Window & { ZIP_CAT_STATIC?: boolean }).ZIP_CAT_STATIC === true;
+const localSuggestRegistry = staticMode
+  ? {
+    search: [],
+    suggest: [wikipediaTitlePlugin(), wiktionaryHeadwordPlugin()],
+    filters: []
+  }
+  : undefined;
 const allowedMarkdownTags = new Set([
   "A",
   "BLOCKQUOTE",
@@ -144,6 +248,16 @@ const allowedMarkdownTags = new Set([
   "TR",
   "UL"
 ]);
+let activeVoiceRecorder: VoiceRecorderState | undefined;
+let voiceEngine: VoiceEngine = staticMode || localStorage.getItem("zip.cat.voiceEngine") === "browser" ? "browser" : "server";
+let aiEngine: AiEngine = staticMode || localStorage.getItem("zip.cat.aiEngine") === "browser-gemma" ? "browser-gemma" : "openrouter";
+let browserGemmaWorker: Worker | undefined;
+let browserGemmaStatusMessage = "";
+let browserMoonshineWorker: Worker | undefined;
+let browserMoonshineStatus: "idle" | "loading" | "ready" | "error" = "idle";
+let browserMoonshineStatusMessage = "";
+let browserMoonshineActiveHandler: ((payload: BrowserMoonshineMessage) => void) | undefined;
+let threadIdCounter = 0;
 
 function escapeHtml(value: string) {
   return value
@@ -151,6 +265,11 @@ function escapeHtml(value: string) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function nextThreadId() {
+  threadIdCounter += 1;
+  return `thread-${Date.now().toString(36)}-${threadIdCounter.toString(36)}`;
 }
 
 function originForUrl(url: string) {
@@ -211,16 +330,77 @@ function commandWindowReferences(query: string) {
   return references;
 }
 
+function normalizeTypedOutputMarker(marker: string) {
+  return marker.replace(/\s+\[\]$/, "[]");
+}
+
+function typedOutputForMarker(marker: string) {
+  const normalized = normalizeTypedOutputMarker(marker);
+  return typedOutputs.find((descriptor) => descriptor.marker.toLowerCase() === normalized.toLowerCase());
+}
+
+function typedOutputReferences(query: string) {
+  const refs: Array<{ descriptor: TypedOutputDescriptor; marker: string; start: number; end: number }> = [];
+  for (const match of query.matchAll(/#([A-Za-z][A-Za-z0-9_]*)(\s*\[\])?/g)) {
+    const marker = `#${match[1]}${match[2] ? "[]" : ""}`;
+    const descriptor = typedOutputForMarker(marker);
+    if (!descriptor) {
+      continue;
+    }
+    refs.push({
+      descriptor,
+      marker: descriptor.marker,
+      start: match.index,
+      end: match.index + match[0].length
+    });
+  }
+  return refs;
+}
+
+function stripTypedOutputMarkers(query: string) {
+  return query.replace(/#([A-Za-z][A-Za-z0-9_]*)(\s*\[\])?/g, (value) => (
+    typedOutputForMarker(value) ? "" : value
+  )).replace(/\s{2,}/g, " ").trim();
+}
+
+function typedOutputGhostMatch(query: string) {
+  const match = query.match(/#([A-Za-z][A-Za-z0-9_]*)?(\[\]?)?$/);
+  if (!match || typedOutputs.length === 0) {
+    return undefined;
+  }
+
+  const partial = match[0].toLowerCase();
+  if (typedOutputForMarker(match[0])) {
+    return undefined;
+  }
+
+  return typedOutputs.find((descriptor) => descriptor.marker.toLowerCase().startsWith(partial));
+}
+
+function typedOutputGhostText(query: string) {
+  const match = query.match(/#([A-Za-z][A-Za-z0-9_]*)?(\[\]?)?$/);
+  const descriptor = typedOutputGhostMatch(query);
+  if (!match || !descriptor) {
+    return "";
+  }
+  return descriptor.marker.slice(match[0].length);
+}
+
 function commandHighlightHtml(query: string, inlineActive = false, ghostText = "") {
   let lastIndex = 0;
   let html = "";
-  const pattern = /\*\([^)]*\)|\$(\d+)\b/g;
+  const pattern = /\*\([^)]*\)|\$(\d+)\b|#([A-Za-z][A-Za-z0-9_]*)(\s*\[\])?/g;
   for (const match of query.matchAll(pattern)) {
     html += escapeHtml(query.slice(lastIndex, match.index));
     if (match[0].startsWith("$")) {
       const windowIndex = Number(match[0].slice(1));
       html += commandBlockForIndex(windowIndex)
         ? `<span class="window-ref-pill" data-window-ref="${windowIndex}">${escapeHtml(match[0])}</span>`
+        : escapeHtml(match[0]);
+    } else if (match[0].startsWith("#")) {
+      const descriptor = typedOutputForMarker(match[0]);
+      html += descriptor
+        ? `<span class="typed-output-pill" data-typed-output="${escapeHtml(descriptor.id)}">${escapeHtml(match[0])}</span>`
         : escapeHtml(match[0]);
     } else if (inlineActive) {
       html += `<span class="inline-inference-glow">${escapeHtml(match[0])}</span>`;
@@ -247,8 +427,10 @@ function updateCommandHighlight(searchInput: CommandField, inlineActive = false)
     .some((reference) => Boolean(commandBlockForIndex(reference.index)));
   const hasInlineGlow = inlineActive && inlineInferenceSpans(searchInput.value).length > 0;
   const mode: CommandMode = block.dataset.mode === "ai" ? "ai" : "search";
-  const ghostText = mode === "search" ? slashCommandGhostText(searchInput.value) : "";
-  if (!hasValidWindowRef && !hasInlineGlow && !ghostText) {
+  const typedGhostText = typedOutputGhostText(searchInput.value);
+  const ghostText = typedGhostText || (mode === "search" ? slashCommandGhostText(searchInput.value) : "");
+  const hasTypedOutputRef = typedOutputReferences(searchInput.value).length > 0;
+  if (!hasValidWindowRef && !hasInlineGlow && !ghostText && !hasTypedOutputRef) {
     block.classList.remove("command-highlight-active");
     highlight.replaceChildren();
     return;
@@ -259,8 +441,22 @@ function updateCommandHighlight(searchInput: CommandField, inlineActive = false)
 }
 
 function effortBarsMarkup(effort: EffortLevel, mode: CommandMode = "search") {
-  return `<span class="effort-bars" data-effort="${effort}" aria-label="Effort ${effort} of 5" title="${escapeHtml(effortDescription(mode, effort))}">${[1, 2, 3, 4, 5]
-    .map((level) => `<span class="effort-bar${level <= effort ? " active" : ""}" data-effort-level="${level}" title="${escapeHtml(effortDescription(mode, level as EffortLevel))}" aria-hidden="true"></span>`)
+  const levels = configuredEffortLevels(mode);
+  const available = new Set<EffortLevel>(levels);
+  const configuredEffort = closestConfiguredEffortLevel(effort, mode);
+  return `<span class="effort-bars" data-effort="${configuredEffort}" aria-label="${escapeHtml(effortAriaLabel(mode, configuredEffort, levels))}" title="${escapeHtml(effortDescription(mode, configuredEffort))}">${levels
+    .concat(allEffortLevels.filter((level) => !available.has(level)))
+    .sort((a, b) => a - b)
+    .map((level) => {
+      const isAvailable = available.has(level);
+      const classes = [
+        "effort-bar",
+        isAvailable && level <= configuredEffort ? "active" : "",
+        isAvailable ? "" : "unavailable"
+      ].filter(Boolean).join(" ");
+      const title = isAvailable ? effortDescription(mode, level) : `Level ${level} is not configured`;
+      return `<span class="${classes}" data-effort-level="${level}" title="${escapeHtml(title)}" aria-hidden="true"></span>`;
+    })
     .join("")}</span>`;
 }
 
@@ -326,7 +522,8 @@ function renderEntry(
   content: string,
   mode: CommandMode = "search",
   effort: EffortLevel = 3,
-  slashArgValues: Record<string, unknown> = {}
+  slashArgValues: Record<string, unknown> = {},
+  threadParentId?: string
 ) {
   const prompt = mode === "ai" ? "*" : "&gt;";
   const slashCommand = slashCommandForQuery(query);
@@ -334,8 +531,11 @@ function renderEntry(
     ? slashArgValues
     : slashArgsFromInlineQuery(query, slashCommand);
   const displayQuery = slashDisplayQuery(query, slashCommand);
-  return `<div class="query-row">
-    <section class="entry" data-mode="${mode}" data-effort="${effort}">
+  const threadId = nextThreadId();
+  const threadParentAttr = threadParentId ? ` data-thread-parent="${escapeHtml(threadParentId)}"` : "";
+  const threadRowClass = threadParentId ? " query-row-thread-child" : "";
+  return `<div class="query-row${threadRowClass}" data-thread-id="${escapeHtml(threadId)}"${threadParentAttr}>
+    <section class="entry" data-mode="${mode}" data-effort="${effort}" data-thread-id="${escapeHtml(threadId)}"${threadParentAttr} data-original-query="${escapeHtml(query)}">
       <span class="status-label" aria-hidden="true">$0</span>
       ${runStatusMarkup()}
       ${effortBarsMarkup(effort, mode)}
@@ -345,6 +545,7 @@ function renderEntry(
           <textarea class="entry-input" aria-label="Previous search" name="q" rows="1">${escapeHtml(displayQuery)}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
+        <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
         ${slashCommandControlsMarkup(slashCommand, slashValues)}
       </form>
       <div class="results">${content}</div>
@@ -385,12 +586,74 @@ let commandMode: CommandMode = "search";
 let effortLevel: EffortLevel = 3;
 let effortConfig: EffortConfig | undefined;
 let slashCommands: SlashCommandDescriptor[] = [];
+let typedOutputs: TypedOutputDescriptor[] = [];
 let activeWindowReferenceTarget: HTMLElement | undefined;
 let effortMenuContext: EffortContext | undefined;
+let suggestSuppressedUntil = 0;
 const debugPayloads = new WeakMap<HTMLElement, DebugPayload>();
 
 function normalizeEffortLevel(level: number) {
   return Math.min(Math.max(Math.round(level), 1), 5) as EffortLevel;
+}
+
+function staticEffortConfig(): EffortConfig {
+  return {
+    search: {
+      provider: "duckduckgo",
+      api: "DuckDuckGo Instant Answer API",
+      levels: {
+        "1": duckDuckGoInstantDescriptor()
+      }
+    },
+    ai: {
+      provider: "browser WebGPU",
+      api: "local browser worker",
+      levels: {
+        "1": {
+          id: "static.gemma.webgpu.local",
+          name: "Local Gemma 4 WebGPU",
+          kind: "ai" as const,
+          provider: "browser WebGPU",
+          api: "local browser worker",
+          effort: 1,
+          label: "local",
+          detail: "100% local in-browser inference",
+          pricing: "$0"
+        }
+      }
+    }
+  };
+}
+
+function duckDuckGoInstantDescriptor(): GeneratorDescriptor {
+  return {
+    id: "duckduckgo.instant.local",
+    name: "DuckDuckGo Instant Answer",
+    kind: "web-search",
+    provider: "duckduckgo",
+    api: "DuckDuckGo Instant Answer API",
+    effort: 1,
+    label: "instant-answer",
+    detail: "local no-key JSON/JSONP; instant answers, topics, definitions, and related links; not full organic search results",
+    pricing: "$0"
+  };
+}
+
+function withLocalDuckDuckGoEffort(config: EffortConfig): EffortConfig {
+  return {
+    ...config,
+    search: {
+      ...config.search,
+      levels: {
+        ...config.search.levels,
+        "1": duckDuckGoInstantDescriptor()
+      }
+    }
+  };
+}
+
+function isDuckDuckGoInstantEffort(effort: EffortLevel) {
+  return effort === 1;
 }
 
 function slashCommandForQuery(query: string) {
@@ -447,7 +710,7 @@ function acceptSlashCommandGhost(searchInput: CommandField) {
     return false;
   }
 
-  searchInput.value = command.command;
+  searchInput.value = `${command.command} `;
   resizeCommandField(searchInput);
   updateCommandHighlight(searchInput);
   updateSlashCommandControls(searchInput);
@@ -455,6 +718,20 @@ function acceptSlashCommandGhost(searchInput: CommandField) {
   slashControlsForInput(searchInput)
     ?.querySelector<HTMLInputElement>("[data-slash-arg]")
     ?.focus();
+  return true;
+}
+
+function acceptTypedOutputGhost(searchInput: CommandField) {
+  const match = searchInput.value.match(/#([A-Za-z][A-Za-z0-9_]*)?(\[\]?)?$/);
+  const descriptor = typedOutputGhostMatch(searchInput.value);
+  if (!match || !descriptor) {
+    return false;
+  }
+
+  searchInput.value = `${searchInput.value.slice(0, match.index)}${descriptor.marker} `;
+  resizeCommandField(searchInput);
+  updateCommandHighlight(searchInput);
+  scheduleSuggest(searchInput);
   return true;
 }
 
@@ -577,8 +854,44 @@ function updateSlashCommandControls(searchInput: CommandField) {
   }
 }
 
+function configuredEffortLevels(mode: CommandMode): EffortLevel[] {
+  const configured = mode === "ai" ? effortConfig?.ai.levels : effortConfig?.search.levels;
+  const levels = Object.keys(configured ?? {})
+    .map((level) => Number(level))
+    .filter((level): level is EffortLevel => Number.isInteger(level) && level >= 1 && level <= 5)
+    .sort((a, b) => a - b);
+  return levels.length > 0 ? levels : ([1, 2, 3, 4, 5] as EffortLevel[]);
+}
+
+function closestConfiguredEffortLevel(effort: EffortLevel, mode: CommandMode) {
+  const levels = configuredEffortLevels(mode);
+  return levels.reduce((best, level) => (
+    Math.abs(level - effort) < Math.abs(best - effort) ? level : best
+  ), levels[0]);
+}
+
+function adjacentConfiguredEffortLevel(effort: EffortLevel, mode: CommandMode, delta: -1 | 1) {
+  const levels = configuredEffortLevels(mode);
+  const closest = closestConfiguredEffortLevel(effort, mode);
+  const currentIndex = levels.indexOf(closest);
+  const nextIndex = Math.min(Math.max(currentIndex + delta, 0), levels.length - 1);
+  return levels[nextIndex];
+}
+
+function effortAriaLabel(mode: CommandMode, effort: EffortLevel, levels = configuredEffortLevels(mode)) {
+  const configuredEffort = closestConfiguredEffortLevel(effort, mode);
+  if (levels.length === 1) {
+    return `${mode === "ai" ? "AI" : "Search"} generator ${configuredEffort}`;
+  }
+  return `Effort ${configuredEffort} of 5`;
+}
+
 function effortDescription(mode: CommandMode, effort: EffortLevel) {
   if (mode === "ai") {
+    if (aiEngine === "browser-gemma") {
+      return "Local Gemma 4 WebGPU; runs 100% in this browser; downloads the model on first selection and caches it in site storage; $0 API cost";
+    }
+
     const generator = effortConfig?.ai.levels[String(effort)];
     return generator
       ? `Effort ${effort} of 5: ${generator.name}; ${generator.api} via ${generator.provider}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
@@ -657,20 +970,165 @@ function formatOpenRouterCost(usage: Record<string, unknown> | undefined) {
 }
 
 function searchCallPricingDescription(effort: EffortLevel, _resultCount: number) {
+  if (staticMode || isDuckDuckGoInstantEffort(effort)) {
+    return "$0";
+  }
+
   const generator = effortConfig?.search.levels[String(effort)];
-  if (generator?.label === "deep") {
+  if (generator?.provider === "serpapi") {
+    return undefined;
+  }
+  if (generator?.provider === "exa" && generator.label === "deep") {
     return formatCost(12 / 1000);
+  }
+  if (generator?.provider && generator.provider !== "exa") {
+    return undefined;
   }
 
   return formatCost(7 / 1000);
 }
 
+function flattenDuckDuckGoTopics(topics: unknown[]): Array<Record<string, unknown>> {
+  return topics.flatMap((topic) => {
+    if (!topic || typeof topic !== "object" || Array.isArray(topic)) {
+      return [];
+    }
+
+    const record = topic as Record<string, unknown>;
+    if (Array.isArray(record.Topics)) {
+      return flattenDuckDuckGoTopics(record.Topics);
+    }
+
+    return [record];
+  });
+}
+
+function jsonp<T>(url: string, callbackParam = "callback") {
+  return new Promise<T>((resolve, reject) => {
+    const callbackName = `zipCatJsonp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    const jsonpWindow = window as unknown as Window & Record<string, unknown>;
+    const script = document.createElement("script");
+    const separator = url.includes("?") ? "&" : "?";
+    script.src = `${url}${separator}${callbackParam}=${encodeURIComponent(callbackName)}`;
+    script.async = true;
+    const cleanup = () => {
+      script.remove();
+      delete jsonpWindow[callbackName];
+    };
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("DuckDuckGo request timed out."));
+    }, 8000);
+
+    jsonpWindow[callbackName] = (payload: T) => {
+      window.clearTimeout(timeout);
+      cleanup();
+      resolve(payload);
+    };
+    script.addEventListener("error", () => {
+      window.clearTimeout(timeout);
+      cleanup();
+      reject(new Error("DuckDuckGo request failed."));
+    }, { once: true });
+    document.head.append(script);
+  });
+}
+
+type DuckDuckGoInstantAnswer = {
+  AbstractText?: string;
+  AbstractURL?: string;
+  Heading?: string;
+  Results?: Array<Record<string, unknown>>;
+  RelatedTopics?: unknown[];
+};
+
+async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel): Promise<SearchResponse> {
+  const startedAt = performance.now();
+  // DuckDuckGo Instant Answer is no-key JSON/JSONP for answers and related topics, not a full organic SERP API.
+  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
+  const payload = await jsonp<DuckDuckGoInstantAnswer>(url);
+  const candidates: SearchResult[] = [];
+  const pushResult = (resultUrl: unknown, title: unknown) => {
+    if (typeof resultUrl !== "string" || !resultUrl.trim()) {
+      return;
+    }
+    const text = typeof title === "string" && title.trim() ? title.trim() : resultUrl;
+    candidates.push({
+      url: resultUrl,
+      title: text,
+      provider: "duckduckgo.instant"
+    });
+  };
+
+  pushResult(payload.AbstractURL, payload.Heading || payload.AbstractText);
+  (payload.Results ?? []).forEach((result) => pushResult(result.FirstURL, result.Text));
+  flattenDuckDuckGoTopics(payload.RelatedTopics ?? []).forEach((result) => pushResult(result.FirstURL, result.Text));
+
+  const seen = new Set<string>();
+  const results = candidates
+    .filter((result) => {
+      if (seen.has(result.url)) {
+        return false;
+      }
+      seen.add(result.url);
+      return true;
+    })
+    .slice(0, Math.max(3, effort * 3));
+
+  if (results.length === 0) {
+    results.push({
+      url: `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
+      title: `Search DuckDuckGo for ${query}`,
+      provider: "duckduckgo"
+    });
+  }
+
+  return {
+    query,
+    results,
+    resultSets: [
+      {
+        pluginId: "duckduckgo.instant.static",
+        placement: {
+          target: "results",
+          renderer: "url-table"
+        },
+        schema: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["url"],
+            properties: {
+              url: { type: "string" },
+              title: { type: "string" }
+            }
+          }
+        },
+        results
+      }
+    ],
+    elapsedMs: performance.now() - startedAt
+  };
+}
+
 function updateEffortBars(bars: HTMLElement, effort: EffortLevel, mode: CommandMode) {
-  bars.dataset.effort = String(effort);
-  bars.setAttribute("aria-label", `Effort ${effort} of 5`);
-  bars.setAttribute("title", effortDescription(mode, effort));
-  bars.innerHTML = [1, 2, 3, 4, 5]
-    .map((level) => `<span class="effort-bar${level <= effort ? " active" : ""}" data-effort-level="${level}" title="${escapeHtml(effortDescription(mode, level as EffortLevel))}" aria-hidden="true"></span>`)
+  const levels = configuredEffortLevels(mode);
+  const available = new Set<EffortLevel>(levels);
+  const configuredEffort = closestConfiguredEffortLevel(effort, mode);
+  bars.dataset.effort = String(configuredEffort);
+  bars.setAttribute("aria-label", effortAriaLabel(mode, configuredEffort, levels));
+  bars.setAttribute("title", effortDescription(mode, configuredEffort));
+  bars.innerHTML = allEffortLevels
+    .map((level) => {
+      const isAvailable = available.has(level);
+      const classes = [
+        "effort-bar",
+        isAvailable && level <= configuredEffort ? "active" : "",
+        isAvailable ? "" : "unavailable"
+      ].filter(Boolean).join(" ");
+      const title = isAvailable ? effortDescription(mode, level) : `Level ${level} is not configured`;
+      return `<span class="${classes}" data-effort-level="${level}" title="${escapeHtml(title)}" aria-hidden="true"></span>`;
+    })
     .join("");
 }
 
@@ -686,7 +1144,7 @@ function refreshEffortTitles() {
 }
 
 function setEffortLevel(level: number) {
-  effortLevel = normalizeEffortLevel(level);
+  effortLevel = closestConfiguredEffortLevel(normalizeEffortLevel(level), commandMode);
   const bars = currentCommand?.querySelector<HTMLElement>(".effort-bars");
   if (bars) {
     updateEffortBars(bars, effortLevel, commandMode);
@@ -735,7 +1193,10 @@ function adjustActiveEffort(delta: -1 | 1) {
     return false;
   }
 
-  const nextEffort = normalizeEffortLevel(context.effort + delta);
+  const nextEffort = adjacentConfiguredEffortLevel(context.effort, context.mode, delta);
+  if (nextEffort === closestConfiguredEffortLevel(context.effort, context.mode)) {
+    return false;
+  }
   if (context.entry) {
     context.entry.dataset.effort = String(nextEffort);
     updateEffortBars(context.bars, nextEffort, context.mode);
@@ -751,7 +1212,23 @@ function closeEffortMenu() {
   effortMenuContext = undefined;
 }
 
+function setAiEngine(engine: AiEngine) {
+  if (staticMode && engine !== "browser-gemma") {
+    return;
+  }
+  aiEngine = engine;
+  localStorage.setItem("zip.cat.aiEngine", engine);
+  refreshEffortTitles();
+  if (engine === "browser-gemma") {
+    preloadBrowserGemma();
+  }
+}
+
 function applyEffortSelection(context: EffortContext, nextEffort: EffortLevel) {
+  if (context.mode === "ai" && !staticMode) {
+    setAiEngine("openrouter");
+  }
+
   if (context.entry) {
     context.entry.dataset.effort = String(nextEffort);
     updateEffortBars(context.bars, nextEffort, context.mode);
@@ -769,15 +1246,24 @@ function openEffortMenu(context: EffortContext) {
   menu.className = "effort-menu";
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", "Select effort level");
-  menu.innerHTML = ([1, 2, 3, 4, 5] as EffortLevel[])
+  const effortLevels = staticMode && context.mode === "ai" ? [] : configuredEffortLevels(context.mode);
+  const activeEffort = closestConfiguredEffortLevel(context.effort, context.mode);
+  const effortOptions = effortLevels
     .map((level) => {
-      const active = level === context.effort ? " active" : "";
+      const active = level === activeEffort && (context.mode !== "ai" || aiEngine === "openrouter") ? " active" : "";
       return `<button class="effort-menu-option${active}" type="button" role="menuitem" data-effort-level="${level}">
         <span class="effort-menu-level">Level ${level}</span>
         <span class="effort-menu-detail">${escapeHtml(effortMenuDescription(context.mode, level))}</span>
       </button>`;
     })
     .join("");
+  const localGemmaOption = context.mode === "ai"
+    ? `<button class="effort-menu-option${aiEngine === "browser-gemma" ? " active" : ""}" type="button" role="menuitem" data-ai-engine="browser-gemma">
+        <span class="effort-menu-level">Local</span>
+        <span class="effort-menu-detail">Gemma 4 WebGPU; in-browser only; first use downloads and caches the model; $0 API cost</span>
+      </button>`
+    : "";
+  menu.innerHTML = `${effortOptions}${localGemmaOption}`;
   document.body.append(menu);
 
   const rect = context.bars.getBoundingClientRect();
@@ -839,6 +1325,79 @@ function activeSearchInput() {
   }
 
   return undefined;
+}
+
+function selectionForCommandInput(searchInput: CommandField, preserveCurrentSelection = true): CommandSelection {
+  const isFocused = document.activeElement === searchInput;
+  if (preserveCurrentSelection && isFocused) {
+    const start = searchInput.selectionStart ?? searchInput.value.length;
+    const end = searchInput.selectionEnd ?? start;
+    return {
+      start,
+      end,
+      direction: searchInput.selectionDirection ?? "none"
+    };
+  }
+
+  const end = searchInput.value.length;
+  return {
+    start: end,
+    end,
+    direction: "none"
+  };
+}
+
+function focusCommandInput(searchInput: CommandField, selection = selectionForCommandInput(searchInput)) {
+  searchInput.focus({ preventScroll: true });
+  searchInput.setSelectionRange(selection.start, selection.end, selection.direction);
+}
+
+function commandModeForInput(searchInput: CommandField) {
+  const block = searchInput.closest<HTMLElement>(".entry, .current-command");
+  return block?.dataset.mode === "ai" ? "ai" : "search";
+}
+
+function isEnterKeyEvent(event: KeyboardEvent) {
+  return event.key === "Enter" ||
+    event.key === "Return" ||
+    event.code === "Enter" ||
+    event.code === "NumpadEnter" ||
+    event.keyCode === 13 ||
+    event.which === 13;
+}
+
+function isOptionEnterEvent(event: KeyboardEvent) {
+  const optionPressed = event.altKey || event.getModifierState?.("Alt") === true;
+  return optionPressed &&
+    !event.shiftKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.isComposing &&
+    isEnterKeyEvent(event);
+}
+
+function commandInputFromEventTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
+    return undefined;
+  }
+
+  return target.matches('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
+    ? target
+    : undefined;
+}
+
+function submitThreadedAiInput(searchInput: CommandField, event: KeyboardEvent) {
+  if (commandModeForInput(searchInput) !== "ai") {
+    return false;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  if (searchInput.form) {
+    searchInput.form.dataset.threadSubmit = "true";
+    searchInput.form.requestSubmit();
+  }
+  return true;
 }
 
 function shortcutFromCode(code: string) {
@@ -992,6 +1551,132 @@ function entryLabel(entry: HTMLElement) {
   return entry.querySelector<HTMLElement>(".status-label")?.textContent?.trim() ?? "$?";
 }
 
+function entryRow(entry: HTMLElement) {
+  return entry.closest<HTMLElement>(".query-row");
+}
+
+function ensureEntryThreadId(entry: HTMLElement) {
+  const existing = entry.dataset.threadId;
+  if (existing) {
+    return existing;
+  }
+
+  const threadId = nextThreadId();
+  entry.dataset.threadId = threadId;
+  entryRow(entry)?.setAttribute("data-thread-id", threadId);
+  return threadId;
+}
+
+function setEntryThreadParent(entry: HTMLElement, parentId: string) {
+  entry.dataset.threadParent = parentId;
+  const row = entryRow(entry);
+  if (row) {
+    row.dataset.threadParent = parentId;
+    row.classList.add("query-row-thread-child");
+  }
+}
+
+function entryForThreadId(threadId: string | undefined) {
+  if (!threadId) {
+    return undefined;
+  }
+
+  return Array.from(document.querySelectorAll<HTMLElement>(".entry"))
+    .find((entry) => entry.dataset.threadId === threadId);
+}
+
+function aiPromptForEntry(entry: HTMLElement) {
+  const debug = debugPayloads.get(entry);
+  const debugPrompt = typeof debug?.userPrompt === "string" ? debug.userPrompt.trim() : "";
+  const originalQuery = entry.dataset.originalQuery?.trim() ?? "";
+  const inputQuery = entry.querySelector<CommandField>('textarea[name="q"], input[name="q"]')?.value.trim() ?? "";
+  return debugPrompt || originalQuery || inputQuery;
+}
+
+function aiResponseForEntry(entry: HTMLElement) {
+  const debug = debugPayloads.get(entry);
+  const apiCall = debug?.apiCall;
+  if (apiCall && typeof apiCall === "object" && !Array.isArray(apiCall)) {
+    const responseBody = (apiCall as Record<string, unknown>).responseBody;
+    if (responseBody && typeof responseBody === "object" && !Array.isArray(responseBody)) {
+      const text = (responseBody as Record<string, unknown>).text;
+      if (typeof text === "string" && text.trim()) {
+        return text.trim();
+      }
+    }
+  }
+
+  return entry.querySelector<HTMLElement>(".ai-response")?.innerText.trim() ?? "";
+}
+
+function aiThreadChain(parentEntry: HTMLElement) {
+  const chain: HTMLElement[] = [];
+  let entry: HTMLElement | undefined = parentEntry;
+  const seen = new Set<string>();
+
+  while (entry) {
+    const threadId = ensureEntryThreadId(entry);
+    if (seen.has(threadId)) {
+      break;
+    }
+    seen.add(threadId);
+    chain.unshift(entry);
+    entry = entryForThreadId(entry.dataset.threadParent);
+  }
+
+  return chain;
+}
+
+function aiThreadContext(parentEntry: HTMLElement): AiThreadContext {
+  const parentId = ensureEntryThreadId(parentEntry);
+  return {
+    parentId,
+    parentWindow: entryLabel(parentEntry),
+    turns: aiThreadChain(parentEntry).map((entry) => ({
+      window: entryLabel(entry),
+      prompt: aiPromptForEntry(entry),
+      response: aiResponseForEntry(entry)
+    }))
+  };
+}
+
+function threadMessagesForPrompt(prompt: string, thread: AiThreadContext | undefined): AiChatMessage[] | undefined {
+  if (!thread || thread.turns.length === 0) {
+    return undefined;
+  }
+
+  const messages: AiChatMessage[] = [];
+  thread.turns.forEach((turn) => {
+    if (turn.prompt) {
+      messages.push({
+        role: "user",
+        content: turn.prompt
+      });
+    }
+    if (turn.response) {
+      messages.push({
+        role: "assistant",
+        content: turn.response
+      });
+    }
+  });
+  messages.push({
+    role: "user",
+    content: prompt
+  });
+  return messages;
+}
+
+function promptWithThreadFallback(prompt: string, messages: AiChatMessage[] | undefined) {
+  if (!messages?.length) {
+    return prompt;
+  }
+
+  return messages
+    .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+    .join("\n\n");
+}
+
 function setEntryDebug(results: HTMLElement, payload: DebugPayload) {
   const entry = results.closest<HTMLElement>(".entry");
   if (!entry) {
@@ -1008,7 +1693,7 @@ function setEntryDebug(results: HTMLElement, payload: DebugPayload) {
 }
 
 function providerCallFrom(debug: Record<string, unknown> | undefined) {
-  return debug?.providerCall;
+  return debug?.providerCall ?? debug?.modelProviderCall;
 }
 
 function fallbackDebugPayload(entry: HTMLElement): DebugPayload {
@@ -1305,6 +1990,87 @@ function renderAiText(text: string) {
   return `<div class="ai-response">${decorateWindowReferences(sanitizeMarkdownHtml(html))}</div>`;
 }
 
+function stringValue(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberValue(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function renderRestaurantCard(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return `<pre class="typed-json">${escapeHtml(JSON.stringify(value, null, 2))}</pre>`;
+  }
+
+  const record = value as Record<string, unknown>;
+  const name = stringValue(record, "name") ?? "Restaurant";
+  const category = stringValue(record, "category");
+  const cuisine = stringValue(record, "cuisine");
+  const priceRange = stringValue(record, "priceRange");
+  const rating = numberValue(record, "rating");
+  const ratingSource = stringValue(record, "ratingSource");
+  const website = stringValue(record, "website");
+  const phone = stringValue(record, "phone");
+  const locationParts = [
+    stringValue(record, "address"),
+    stringValue(record, "city"),
+    stringValue(record, "region"),
+    stringValue(record, "postalCode"),
+    stringValue(record, "country")
+  ].filter(Boolean);
+  const mapQuery = stringValue(record, "mapQuery") ?? (locationParts.join(", ") || name);
+  const mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(mapQuery)}`;
+  const detailParts = [
+    category,
+    cuisine,
+    priceRange,
+    rating === undefined ? undefined : `${rating.toFixed(1)}${ratingSource ? ` ${ratingSource}` : " rating"}`
+  ].filter(Boolean);
+
+  return `<article class="restaurant-card">
+    <div class="restaurant-main">
+      <h3>${escapeHtml(name)}</h3>
+      ${detailParts.length ? `<p class="restaurant-meta">${detailParts.map((part) => escapeHtml(String(part))).join(" · ")}</p>` : ""}
+      ${locationParts.length ? `<p class="restaurant-address">${escapeHtml(locationParts.join(", "))}</p>` : ""}
+      <div class="restaurant-actions">
+        <a href="${escapeHtml(mapUrl)}" target="_blank" rel="noreferrer">Map</a>
+        ${website && isSafeLink(website) ? `<a href="${escapeHtml(website)}" target="_blank" rel="noreferrer">Website</a>` : ""}
+        ${phone ? `<span>${escapeHtml(phone)}</span>` : ""}
+      </div>
+    </div>
+    <a class="restaurant-map" href="${escapeHtml(mapUrl)}" target="_blank" rel="noreferrer" aria-label="Open map for ${escapeHtml(name)}">
+      <span>${escapeHtml(locationParts.slice(1, 3).join(", ") || "Map")}</span>
+    </a>
+  </article>`;
+}
+
+function renderTypedOutput(output: TypedOutputResult | undefined, fallbackText: string) {
+  if (!output) {
+    return renderAiText(fallbackText);
+  }
+
+  if (output.descriptor.renderer === "boolean") {
+    if (typeof output.value === "boolean") {
+      return `<div class="ai-response typed-response typed-bool">${output.value ? "True" : "False"}</div>`;
+    }
+    return `<div class="ai-response typed-response"><pre class="typed-json">${escapeHtml(JSON.stringify(output.value, null, 2))}</pre></div>`;
+  }
+
+  if (output.descriptor.renderer === "restaurant-card") {
+    return `<div class="ai-response typed-response">${renderRestaurantCard(output.value)}</div>`;
+  }
+
+  if (output.descriptor.renderer === "restaurant-list") {
+    const items = Array.isArray(output.value) ? output.value : [output.value];
+    return `<div class="ai-response typed-response restaurant-list">${items.map(renderRestaurantCard).join("")}</div>`;
+  }
+
+  return `<div class="ai-response typed-response"><pre class="typed-json">${escapeHtml(JSON.stringify(output.value, null, 2))}</pre></div>`;
+}
+
 function roundedNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : undefined;
 }
@@ -1549,6 +2315,39 @@ function clearSuggestionsFor(searchInput: CommandField) {
   suggestionContextFor(searchInput)?.replaceChildren();
 }
 
+function renderSuggestionsForInput(sourceInput: CommandField, suggestionContext: HTMLElement, payload: SuggestResponse) {
+  const shortcutOffset = resultShortcutCountFor(sourceInput);
+  suggestionContext.innerHTML = payload.suggestions
+    .map((suggestion, index) => renderSuggestionPill(suggestion, index + shortcutOffset))
+    .join("");
+  clearSuggestionSelection();
+  if (sourceInput === input) {
+    scrollToPrompt();
+  }
+}
+
+function rerunEmptyTypedServerEntries() {
+  document.querySelectorAll<HTMLElement>(".entry").forEach((entry) => {
+    if (entry.dataset.typedReplay === "done") {
+      return;
+    }
+
+    const input = entry.querySelector<CommandField>(".entry-input");
+    const results = entry.querySelector<HTMLElement>(".results");
+    if (!input || !results || typedOutputReferences(input.value).length === 0) {
+      return;
+    }
+
+    const hasRenderedContent = Boolean(results.querySelector("table, .ai-response, .status, .weather-card, .restaurant-card"));
+    if (hasRenderedContent || results.textContent?.trim()) {
+      return;
+    }
+
+    entry.dataset.typedReplay = "done";
+    input.form?.requestSubmit();
+  });
+}
+
 function scheduleSuggest(source?: CommandField) {
   const sourceInput = source ?? activeSearchInput();
   const suggestionContext = sourceInput ? suggestionContextFor(sourceInput) : undefined;
@@ -1558,6 +2357,10 @@ function scheduleSuggest(source?: CommandField) {
 
   suggestAbort?.abort();
   clearSuggestionsFor(sourceInput);
+
+  if (Date.now() < suggestSuppressedUntil) {
+    return;
+  }
 
   if (isSlashCommandInput(sourceInput.value)) {
     return;
@@ -1572,39 +2375,54 @@ function scheduleSuggest(source?: CommandField) {
   suggestAbort = requestAbort;
   void (async () => {
     try {
-      const response = await fetch("/api/suggest", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({
-          query,
-          trigger: {
-            type: "input-change",
-            source: "search-box"
-          }
-        }),
-        signal: requestAbort.signal
-      });
-      const payload = await response.json() as SuggestResponse & { error?: string };
+      const suggestRequest = {
+        query,
+        trigger: {
+          type: "input-change" as const,
+          source: "search-box" as const
+        }
+      };
+      const payload = staticMode && localSuggestRegistry
+        ? await runLocalSuggest(localSuggestRegistry, suggestRequest)
+        : await (async () => {
+          const response = await fetch("/api/suggest", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json"
+            },
+            body: JSON.stringify(suggestRequest),
+            signal: requestAbort.signal
+          });
+          const serverPayload = await response.json() as SuggestResponse & { error?: string };
 
-      if (!response.ok || activeSearchInput() !== sourceInput || sourceInput.value.trim() !== query || suggestAbort !== requestAbort) {
+          if (!response.ok) {
+            suggestSuppressedUntil = Date.now() + 5000;
+            clearSuggestionsFor(sourceInput);
+          }
+
+          return serverPayload;
+        })();
+
+      if (requestAbort.signal.aborted) {
         return;
       }
 
-      const shortcutOffset = resultShortcutCountFor(sourceInput);
-      suggestionContext.innerHTML = payload.suggestions
-        .map((suggestion, index) => renderSuggestionPill(suggestion, index + shortcutOffset))
-        .join("");
-      clearSuggestionSelection();
-      if (sourceInput === input) {
-        scrollToPrompt();
+      if (activeSearchInput() !== sourceInput || sourceInput.value.trim() !== query || suggestAbort !== requestAbort) {
+        return;
       }
+
+      if (!Array.isArray(payload.suggestions)) {
+        clearSuggestionsFor(sourceInput);
+        return;
+      }
+
+      renderSuggestionsForInput(sourceInput, suggestionContext, payload);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return;
       }
       if (suggestAbort === requestAbort) {
+        suggestSuppressedUntil = Date.now() + 5000;
         clearSuggestionsFor(sourceInput);
       }
     }
@@ -1624,16 +2442,17 @@ function bindSuggestionInput(searchInput: CommandField) {
       !keyboardEvent.ctrlKey &&
       !keyboardEvent.metaKey &&
       !keyboardEvent.isComposing &&
-      acceptSlashCommandGhost(searchInput)
+      (
+        acceptTypedOutputGhost(searchInput) ||
+        acceptSlashCommandGhost(searchInput)
+      )
     ) {
       keyboardEvent.preventDefault();
       return;
     }
 
     if (
-      keyboardEvent.key !== "Enter" ||
-      keyboardEvent.shiftKey ||
-      keyboardEvent.altKey ||
+      !isEnterKeyEvent(keyboardEvent) ||
       keyboardEvent.ctrlKey ||
       keyboardEvent.metaKey ||
       keyboardEvent.isComposing
@@ -1641,7 +2460,19 @@ function bindSuggestionInput(searchInput: CommandField) {
       return;
     }
 
+    if (isOptionEnterEvent(keyboardEvent)) {
+      submitThreadedAiInput(searchInput, keyboardEvent);
+      return;
+    }
+
+    if (keyboardEvent.altKey || keyboardEvent.shiftKey) {
+      return;
+    }
+
     keyboardEvent.preventDefault();
+    if (searchInput.form) {
+      delete searchInput.form.dataset.threadSubmit;
+    }
     searchInput.form?.requestSubmit();
   });
   searchInput.addEventListener("input", () => {
@@ -1679,6 +2510,15 @@ window.addEventListener("keydown", (event) => {
       input.focus();
     }
     history.replaceState(null, "", "/");
+    return;
+  }
+
+  if (isOptionSpace(event)) {
+    const button = activeVoiceButton();
+    if (button && !button.disabled) {
+      event.preventDefault();
+      void toggleVoiceRecordingForButton(button);
+    }
     return;
   }
 
@@ -1793,8 +2633,49 @@ document.addEventListener("mouseout", (event) => {
   setWindowReferenceTarget();
 });
 
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  if (!target.closest(".voice-menu, .voice-button")) {
+    closeVoiceMenu();
+  }
+});
+
 document.querySelectorAll<CommandField>('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
   .forEach(bindSuggestionInput);
+bindVoiceButtons();
+
+document.addEventListener("keydown", (event) => {
+  if (!isOptionEnterEvent(event)) {
+    return;
+  }
+
+  const searchInput = commandInputFromEventTarget(event.target);
+  if (!searchInput) {
+    return;
+  }
+
+  submitThreadedAiInput(searchInput, event);
+}, {
+  capture: true
+});
+
+document.addEventListener("keypress", (event) => {
+  if (!isOptionEnterEvent(event)) {
+    return;
+  }
+
+  const searchInput = commandInputFromEventTarget(event.target);
+  if (!searchInput) {
+    return;
+  }
+
+  submitThreadedAiInput(searchInput, event);
+}, {
+  capture: true
+});
 
 document.addEventListener("dblclick", (event) => {
   const target = event.target;
@@ -1846,7 +2727,14 @@ document.addEventListener("click", (event) => {
   const option = target.closest<HTMLElement>(".effort-menu-option");
   if (option && effortMenuContext) {
     event.preventDefault();
-    applyEffortSelection(effortMenuContext, normalizeEffortLevel(Number(option.dataset.effortLevel ?? 3)));
+    if (option.dataset.aiEngine === "browser-gemma") {
+      setAiEngine("browser-gemma");
+      if (effortMenuContext.entry) {
+        updateEffortBars(effortMenuContext.bars, effortMenuContext.effort, effortMenuContext.mode);
+      }
+    } else {
+      applyEffortSelection(effortMenuContext, normalizeEffortLevel(Number(option.dataset.effortLevel ?? 3)));
+    }
     closeEffortMenu();
     return;
   }
@@ -1865,31 +2753,175 @@ document.addEventListener("click", (event) => {
   closeEffortMenu();
 });
 
-void fetch("/api/effort")
-  .then(async (response) => {
-    if (!response.ok) {
-      return;
-    }
-    effortConfig = await response.json() as EffortConfig;
-    refreshEffortTitles();
-  })
-  .catch(() => undefined);
+if (staticMode) {
+  effortConfig = staticEffortConfig();
+  slashCommands = slashCommandDescriptors();
+  typedOutputs = typedOutputDescriptors();
+  effortLevel = 1;
+  setVoiceEngine("browser");
+  preloadBrowserGemma();
+  document
+    .querySelectorAll<CommandField>('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
+    .forEach((field) => {
+      updateSlashCommandControls(field);
+      updateCommandHighlight(field);
+    });
+  refreshEffortTitles();
+} else {
+  void fetch("/api/effort")
+    .then(async (response) => {
+      if (!response.ok) {
+        return;
+      }
+      effortConfig = withLocalDuckDuckGoEffort(await response.json() as EffortConfig);
+      refreshEffortTitles();
+    })
+    .catch(() => undefined);
 
-void fetch("/api/slash/commands")
-  .then(async (response) => {
-    if (!response.ok) {
-      return;
+  void fetch("/api/slash/commands")
+    .then(async (response) => {
+      if (!response.ok) {
+        return;
+      }
+      const payload = await response.json() as { commands?: SlashCommandDescriptor[] };
+      slashCommands = payload.commands ?? [];
+      document
+        .querySelectorAll<CommandField>('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
+        .forEach((field) => {
+          updateSlashCommandControls(field);
+          updateCommandHighlight(field);
+        });
+    })
+    .catch(() => undefined);
+
+  void fetch("/api/typed-outputs")
+    .then(async (response) => {
+      if (!response.ok) {
+        return;
+      }
+      const payload = await response.json() as { schemas?: TypedOutputDescriptor[] };
+      typedOutputs = payload.schemas ?? [];
+      document
+        .querySelectorAll<CommandField>('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
+        .forEach((field) => updateCommandHighlight(field));
+      rerunEmptyTypedServerEntries();
+    })
+    .catch(() => undefined);
+}
+
+function inlineResolutionPrompt(query: string, spans: string[]) {
+  return `Resolve inline placeholders in a web search query.
+
+Return only strict JSON with this exact shape:
+{"substitutions":["..."],"resolvedQuery":"..."}
+
+Rules:
+- The user query may contain placeholders formatted as *(...).
+- You are given all placeholder contents in order.
+- Return one concise substitution for each placeholder, in the same order.
+- Each substitution should make the search query concrete and real.
+- Do not include explanations, markdown, code fences, or extra keys.
+- resolvedQuery must be the complete search query after replacing every placeholder with its substitution.
+
+Full query:
+${JSON.stringify(query)}
+
+Placeholder contents in order:
+${JSON.stringify(spans)}`;
+}
+
+function inlineResolutionMessages(query: string, spans: string[]): AiChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: "You are a JSON-only query placeholder resolver. Return exactly one valid JSON object and no prose."
+    },
+    {
+      role: "user",
+      content: inlineResolutionPrompt(query, spans)
     }
-    const payload = await response.json() as { commands?: SlashCommandDescriptor[] };
-    slashCommands = payload.commands ?? [];
-    document
-      .querySelectorAll<CommandField>('#terminal-form textarea[name="q"], #terminal-form input[name="q"], .entry-input')
-      .forEach((field) => {
-        updateSlashCommandControls(field);
-        updateCommandHighlight(field);
-      });
-  })
-  .catch(() => undefined);
+  ];
+}
+
+function parseInlineResolutionJson(text: string) {
+  const trimmed = text.trim();
+  const unwrapped = trimmed.startsWith("```")
+    ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
+    : trimmed;
+  const jsonText = unwrapped.match(/\{[\s\S]*\}/)?.[0] ?? unwrapped;
+  const parsed = JSON.parse(jsonText) as {
+    substitutions?: unknown;
+    resolvedQuery?: unknown;
+  };
+  if (!Array.isArray(parsed.substitutions) || typeof parsed.resolvedQuery !== "string") {
+    throw new Error("Inline inference returned invalid JSON.");
+  }
+  return {
+    substitutions: parsed.substitutions.map((value) => String(value).trim()),
+    resolvedQuery: parsed.resolvedQuery.trim()
+  };
+}
+
+function extractInlineSubstitutionsFromText(text: string, expectedCount: number) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^```/.test(line));
+  if (expectedCount === 1 && lines.length > 0) {
+    const compact = lines
+      .find((line) => !/[{}[\]]/.test(line) && line.length <= 80)
+      ?.replace(/^["'`]|["'`]$/g, "")
+      .replace(/[.!?]\s*$/, "")
+      .trim();
+    if (compact) {
+      return [compact];
+    }
+  }
+  return undefined;
+}
+
+function knownInlineSubstitution(span: string) {
+  const normalized = span.trim().toLowerCase();
+  const knownFacts: Record<string, string> = {
+    "capital of france": "paris",
+    "the capital of france": "paris"
+  };
+  return knownFacts[normalized];
+}
+
+function fallbackInlineSubstitutions(spans: string[], rawText = "") {
+  const extracted = extractInlineSubstitutionsFromText(rawText, spans.length);
+  if (extracted?.length === spans.length) {
+    return extracted;
+  }
+
+  const known = spans.map(knownInlineSubstitution);
+  if (known.every(Boolean)) {
+    return known as string[];
+  }
+
+  return undefined;
+}
+
+function reconstructInlineQuery(query: string, substitutions: string[]) {
+  let index = 0;
+  return query.replace(/\*\(([^)]*)\)/g, () => substitutions[index++] ?? "");
+}
+
+class InlineResolutionTraceError extends Error {
+  trace: DebugPayload;
+
+  constructor(message: string, trace: DebugPayload) {
+    super(message);
+    this.name = "InlineResolutionTraceError";
+    this.trace = trace;
+  }
+}
+
+function inlineTraceFromError(error: unknown) {
+  return error instanceof InlineResolutionTraceError ? error.trace : undefined;
+}
 
 async function resolveInlineQuery(query: string, effort: EffortLevel) {
   const spans = inlineInferenceSpans(query);
@@ -1900,6 +2932,124 @@ async function resolveInlineQuery(query: string, effort: EffortLevel) {
       changed: false,
       elapsedMs: 0,
       debug: undefined
+    };
+  }
+
+  if (staticMode) {
+    const requestBody = {
+      query,
+      spans,
+      effort,
+      model: "local-gemma"
+    };
+    const prompt = inlineResolutionPrompt(query, spans);
+    const messages = inlineResolutionMessages(query, spans);
+    const trace: DebugPayload = {
+      phase: "inline-inference",
+      engine: "local-gemma",
+      url: "/browser-gemma-worker.js",
+      method: "Worker.postMessage",
+      requestBody: {
+        ...requestBody,
+        prompt,
+        messages,
+        maxNewTokens: 128
+      },
+      responses: [],
+      warnings: []
+    };
+    const completion = await browserGemmaComplete(
+      prompt,
+      128,
+      undefined,
+      messages
+    );
+    let parsed: ReturnType<typeof parseInlineResolutionJson>;
+    let retryCompletion: Awaited<ReturnType<typeof browserGemmaComplete>> | undefined;
+    (trace.responses as unknown[]).push({
+      attempt: 1,
+      completion
+    });
+    try {
+      parsed = parseInlineResolutionJson(completion.text);
+    } catch (firstParseError) {
+      (trace.responses as unknown[])[0] = {
+        attempt: 1,
+        completion,
+        parseError: firstParseError instanceof Error ? firstParseError.message : String(firstParseError)
+      };
+      const retryPrompt = `Fix this into only valid JSON for the original request. No markdown. No prose.\n\nOriginal request:\n${prompt}\n\nInvalid response:\n${JSON.stringify(completion.text)}`;
+      const retryMessages = inlineResolutionMessages(query, spans);
+      trace.retryRequestBody = {
+        ...requestBody,
+        prompt: retryPrompt,
+        messages: retryMessages,
+        maxNewTokens: 128
+      };
+      retryCompletion = await browserGemmaComplete(
+        retryPrompt,
+        128,
+        undefined,
+        retryMessages
+      );
+      (trace.responses as unknown[]).push({
+        attempt: 2,
+        completion: retryCompletion
+      });
+      try {
+        parsed = parseInlineResolutionJson(retryCompletion.text);
+      } catch (error) {
+        (trace.responses as unknown[])[1] = {
+          attempt: 2,
+          completion: retryCompletion,
+          parseError: error instanceof Error ? error.message : String(error)
+        };
+        const substitutions = fallbackInlineSubstitutions(spans, retryCompletion.text || completion.text);
+        if (!substitutions) {
+          throw new InlineResolutionTraceError(
+            error instanceof Error ? error.message : "Inline inference returned invalid JSON.",
+            trace
+          );
+        }
+        (trace.warnings as unknown[]).push("Used fallback substitutions because local Gemma did not return valid JSON.");
+        parsed = {
+          substitutions,
+          resolvedQuery: reconstructInlineQuery(query, substitutions)
+        };
+      }
+    }
+    if (parsed.substitutions.length !== spans.length) {
+      trace.parsed = parsed;
+      throw new InlineResolutionTraceError("Inline inference substitution count did not match placeholders.", trace);
+    }
+    const resolvedQuery = reconstructInlineQuery(query, parsed.substitutions);
+    if (parsed.resolvedQuery !== resolvedQuery) {
+      (trace.warnings as unknown[]).push({
+        message: "Model resolvedQuery did not match deterministic reconstruction; using deterministic reconstruction.",
+        modelResolvedQuery: parsed.resolvedQuery,
+        reconstructedQuery: resolvedQuery
+      });
+    }
+    trace.parsed = parsed;
+    trace.reconstructedQuery = resolvedQuery;
+    return {
+      originalQuery: query,
+      resolvedQuery,
+      changed: resolvedQuery !== query,
+      elapsedMs: completion.elapsedMs,
+      model: completion.model,
+      provider: completion.provider,
+      usage: undefined,
+      debug: {
+        ...trace,
+        responseStatus: "local",
+        responseBody: retryCompletion
+          ? {
+            completion,
+            retryCompletion
+          }
+          : completion
+      }
     };
   }
 
@@ -1962,9 +3112,11 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
       resizeCommandField(resolvedInput);
       updateCommandHighlight(resolvedInput);
     }
+    const typedOutput = typedOutputReferences(resolved.resolvedQuery)[0]?.descriptor;
+    const searchQuery = typedOutput ? stripTypedOutputMarkers(resolved.resolvedQuery) : resolved.resolvedQuery;
     setRunStatus(results, "search", "active");
     const searchRequestBody = {
-      query: resolved.resolvedQuery,
+      query: searchQuery,
       effort,
       trigger: {
         type: "keyboard",
@@ -1972,25 +3124,35 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
         source: "search-box"
       }
     };
-    const response = await fetch("/api/search", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify(searchRequestBody)
-    });
-    const payload = await response.json() as SearchResponse & { error?: string };
+    const useDuckDuckGoInstant = staticMode || isDuckDuckGoInstantEffort(effort);
+    const response = useDuckDuckGoInstant
+      ? {
+        ok: true,
+        status: "local"
+      }
+      : await fetch("/api/search", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(searchRequestBody)
+      });
+    const payload = useDuckDuckGoInstant
+      ? await duckDuckGoInstantAnswerSearch(searchQuery, effort) as SearchResponse & { error?: string }
+      : await (response as Response).json() as SearchResponse & { error?: string };
     const searchCallPricing = searchCallPricingDescription(effort, payload.results?.length ?? 0);
     setEntryDebug(results, {
       kind: "search",
       userQuery: query,
       resolvedQuery: resolved.resolvedQuery,
+      searchQuery,
+      typedOutput: typedOutput?.marker ?? null,
       effort,
       inlineInference: resolved.debug ?? null,
       modelProviderCall: resolved.debug?.modelProviderCall ?? null,
       apiCall: {
-        url: "/api/search",
-        method: "POST",
+        url: useDuckDuckGoInstant ? "https://api.duckduckgo.com/" : "/api/search",
+        method: useDuckDuckGoInstant ? "JSONP" : "POST",
         requestBody: searchRequestBody,
         responseStatus: response.status,
         responseBody: payload
@@ -2005,8 +3167,90 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
 
     setRunStatus(results, "search", "done", payload.elapsedMs, "Search", searchCallPricing);
     results.innerHTML = renderRows(payload.results ?? []);
+    if (typedOutput && staticMode) {
+      setRunStatus(results, "ai", "error", undefined, "Typed AI", "$0");
+      results.innerHTML = `<div class="status">Typed search shaping is not available in the static build yet.</div>${renderRows(payload.results ?? [])}`;
+      return;
+    }
+    if (typedOutput) {
+      setRunStatus(results, "ai", "active");
+      const shapeRequestBody = {
+        prompt: resolved.resolvedQuery,
+        searchQuery,
+        results: payload.results ?? [],
+        effort,
+        outputSchemaId: typedOutput.id,
+        trigger: {
+          type: "keyboard",
+          key: "Enter",
+          source: "search-box"
+        }
+      };
+      const shapeResponse = await fetch("/api/shape-search", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(shapeRequestBody)
+      });
+      const shapePayload = await shapeResponse.json() as SearchShapeResponse;
+      const shapePricing = formatOpenRouterCost(shapePayload.usage);
+      setEntryDebug(results, {
+        kind: "typed-search",
+        userQuery: query,
+        resolvedQuery: resolved.resolvedQuery,
+        searchQuery,
+        shapeSearchQuery: shapePayload.searchQuery,
+        shapeModelPrompt: typeof shapePayload.debug?.modelPrompt === "string" ? shapePayload.debug.modelPrompt : undefined,
+        typedOutput: typedOutput.marker,
+        effort,
+        inlineInference: resolved.debug ?? null,
+        modelProviderCall: providerCallFrom(shapePayload.debug),
+        searchApiCall: {
+          url: "/api/search",
+          method: "POST",
+          requestBody: searchRequestBody,
+          responseStatus: response.status,
+          responseBody: payload
+        },
+        shapeApiCall: {
+          url: "/api/shape-search",
+          method: "POST",
+          requestBody: shapeRequestBody,
+          responseStatus: shapeResponse.status,
+          responseBody: shapePayload
+        }
+      });
+      if (!shapeResponse.ok) {
+        setRunStatus(results, "ai", "error", shapePayload.elapsedMs, "Typed AI", shapePricing);
+        results.innerHTML = `<div class="status">${escapeHtml(shapePayload.error ?? "Search shaping failed.")}</div>`;
+        return;
+      }
+      setRunStatus(results, "ai", "done", shapePayload.elapsedMs, "Typed AI", shapePricing);
+      results.innerHTML = renderTypedOutput(shapePayload.typedOutput, shapePayload.text);
+      assignAiLinkShortcuts(results);
+    }
   } catch (error) {
-    setRunStatus(results, inlineInferenceSpans(query).length > 0 ? "ai" : "search", "error");
+    const inlineTrace = inlineTraceFromError(error);
+    setEntryDebug(results, {
+      kind: "search-error",
+      userQuery: query,
+      effort,
+      inlineInference: inlineTrace ?? null,
+      apiCall: inlineTrace
+        ? {
+          url: inlineTrace.url ?? "/browser-gemma-worker.js",
+          method: inlineTrace.method ?? "Worker.postMessage",
+          requestBody: inlineTrace.requestBody,
+          responseStatus: "error",
+          responseBody: {
+            error: error instanceof Error ? error.message : "Search failed.",
+            trace: inlineTrace
+          }
+        }
+        : null
+    });
+    setRunStatus(results, inlineInferenceSpans(query).length > 0 || typedOutputReferences(query).length > 0 ? "ai" : "search", "error");
     setInlineInferenceHighlight(results, query, false);
     results.innerHTML = `<div class="status">${escapeHtml(error instanceof Error ? error.message : "Search failed.")}</div>`;
   }
@@ -2027,27 +3271,34 @@ async function runSlashCommand(query: string, results: HTMLElement, searchInput:
     command: command.command,
     args: collectSlashArgs(searchInput, command),
     trigger: {
-      type: "keyboard",
-      key: "Enter",
-      source: "search-box"
+      type: "keyboard" as const,
+      key: "Enter" as const,
+      source: "search-box" as const
     }
   };
 
   try {
-    const response = await fetch("/api/slash", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify(requestBody)
-    });
-    const payload = await response.json() as SlashCommandResponse;
+    const response = staticMode
+      ? {
+        ok: true,
+        status: "local"
+      }
+      : await fetch("/api/slash", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(requestBody)
+      });
+    const payload: SlashCommandResponse & { error?: string } = staticMode
+      ? await executeStaticSlashCommand(requestBody)
+      : await (response as Response).json() as SlashCommandResponse & { error?: string };
     setEntryDebug(results, {
       kind: "slash-command",
       command: command.command,
       apiCall: {
-        url: "/api/slash",
-        method: "POST",
+        url: staticMode ? "browser:slash-command" : "/api/slash",
+        method: staticMode ? "local" : "POST",
         requestBody,
         responseStatus: response.status,
         responseBody: payload
@@ -2068,16 +3319,378 @@ async function runSlashCommand(query: string, results: HTMLElement, searchInput:
   }
 }
 
-async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortLevel) {
+type BrowserGemmaMessage =
+  | {
+      type: "status";
+      requestId?: string;
+      status: "loading" | "ready" | "generating";
+      message: string;
+      progress?: GemmaProgressDetails;
+    }
+  | {
+      type: "token";
+      requestId: string;
+      text: string;
+    }
+  | {
+      type: "done";
+      requestId: string;
+      text: string;
+      elapsedMs: number;
+      model: string;
+      provider: string;
+    }
+  | {
+      type: "error";
+      requestId?: string;
+      error: string;
+    };
+
+type GemmaProgressDetails = {
+  status?: string;
+  message?: string;
+  loaded?: number;
+  total?: number | null;
+  fraction?: number;
+  fromCache?: boolean;
+};
+
+function numberFromUnknown(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function formatBytes(value: number) {
+  if (value >= 1024 * 1024 * 1024) {
+    return `${(value / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)}MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(1)}KB`;
+  }
+  return `${Math.round(value)}B`;
+}
+
+function gemmaProgressPercent(progress: GemmaProgressDetails | undefined) {
+  const fraction = numberFromUnknown(progress?.fraction);
+  if (fraction !== undefined) {
+    return Math.max(0, Math.min(1, fraction > 1 ? fraction / 100 : fraction));
+  }
+
+  const loaded = numberFromUnknown(progress?.loaded);
+  const total = numberFromUnknown(progress?.total);
+  if (loaded !== undefined && total !== undefined && total > 0) {
+    return Math.max(0, Math.min(1, loaded / total));
+  }
+
+  return undefined;
+}
+
+function gemmaProgressDetail(progress: GemmaProgressDetails | undefined) {
+  const loaded = numberFromUnknown(progress?.loaded);
+  const total = numberFromUnknown(progress?.total);
+  const percent = gemmaProgressPercent(progress);
+  const parts = [
+    percent !== undefined ? `${Math.round(percent * 100)}%` : undefined,
+    loaded !== undefined && total !== undefined && total > 0
+      ? `${formatBytes(loaded)} / ${formatBytes(total)}`
+      : loaded !== undefined
+        ? formatBytes(loaded)
+        : undefined,
+    progress?.fromCache ? "cache" : undefined
+  ].filter(Boolean);
+
+  return parts.join(" ");
+}
+
+function gemmaProgressMarkup(message: string, progress?: GemmaProgressDetails, state: "loading" | "ready" | "error" = "loading") {
+  const percent = gemmaProgressPercent(progress);
+  const detail = gemmaProgressDetail(progress);
+  const width = percent === undefined ? 100 : Math.round(percent * 1000) / 10;
+  const indeterminate = percent === undefined && state === "loading" ? " indeterminate" : "";
+  return `<div class="model-progress model-progress-${state}${indeterminate}" role="status" aria-live="polite">
+    <div class="model-progress-row">
+      <span>${escapeHtml(message)}</span>
+      ${detail ? `<span>${escapeHtml(detail)}</span>` : ""}
+    </div>
+    <div class="model-progress-track" aria-hidden="true">
+      <span style="width: ${width}%"></span>
+    </div>
+  </div>`;
+}
+
+function updateGlobalGemmaProgress(message: string, progress?: GemmaProgressDetails, state: "loading" | "ready" | "error" = "loading") {
+  const current = document.querySelector<HTMLElement>(".current-command");
+  if (!current) {
+    return;
+  }
+
+  let progressNode = current.querySelector<HTMLElement>(".model-load-progress");
+  if (state === "ready") {
+    if (!progressNode) {
+      return;
+    }
+    progressNode.innerHTML = gemmaProgressMarkup(message, progress, "ready");
+    window.setTimeout(() => {
+      progressNode?.remove();
+    }, 1800);
+    return;
+  }
+
+  if (!progressNode) {
+    progressNode = document.createElement("div");
+    progressNode.className = "model-load-progress";
+    current.append(progressNode);
+  }
+  progressNode.innerHTML = gemmaProgressMarkup(message, progress, state);
+}
+
+function getBrowserGemmaWorker() {
+  if (!browserGemmaWorker) {
+    browserGemmaWorker = new Worker("/browser-gemma-worker.js", { type: "module" });
+    browserGemmaWorker.addEventListener("message", (event: MessageEvent<BrowserGemmaMessage>) => {
+      const message = event.data;
+      if (message.type === "status" && (message.status === "loading" || message.status === "ready")) {
+        updateGlobalGemmaProgress(message.message, message.progress, message.status);
+        const progressDetail = gemmaProgressDetail(message.progress);
+        const statusMessage = `${message.status}:${message.message}:${progressDetail}`;
+        if (browserGemmaStatusMessage !== statusMessage) {
+          browserGemmaStatusMessage = statusMessage;
+          console.log(`[ai] Gemma ${message.status}: ${message.message}${progressDetail ? ` (${progressDetail})` : ""}`);
+        }
+      } else if (message.type === "error" && !message.requestId) {
+        const statusMessage = `error:${message.error}`;
+        if (browserGemmaStatusMessage !== statusMessage) {
+          browserGemmaStatusMessage = statusMessage;
+          console.log(`[ai] Gemma error: ${message.error}`);
+          updateGlobalGemmaProgress(message.error, undefined, "error");
+        }
+      }
+    });
+  }
+
+  return browserGemmaWorker;
+}
+
+function preloadBrowserGemma() {
+  try {
+    getBrowserGemmaWorker().postMessage({
+      type: "preload"
+    });
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function browserGemmaComplete(prompt: string, maxNewTokens = 512, onText?: (text: string) => void, messages?: AiChatMessage[]) {
+  const requestId = crypto.randomUUID();
+  const worker = getBrowserGemmaWorker();
+  let lastText = "";
+
+  return new Promise<{ text: string; elapsedMs: number; model: string; provider: string }>((resolve, reject) => {
+    const cleanup = () => {
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+    };
+    const onError = (event: ErrorEvent) => {
+      cleanup();
+      reject(new Error(event.message || "Local Gemma request failed."));
+    };
+    const onMessage = (event: MessageEvent<BrowserGemmaMessage>) => {
+      const message = event.data;
+      if (message.requestId && message.requestId !== requestId) {
+        return;
+      }
+      if (message.type === "token") {
+        lastText = message.text;
+        onText?.(lastText);
+        return;
+      }
+      if (message.type === "done") {
+        cleanup();
+        resolve({
+          text: message.text,
+          elapsedMs: message.elapsedMs,
+          model: message.model,
+          provider: message.provider
+        });
+        return;
+      }
+      if (message.type === "error") {
+        cleanup();
+        reject(new Error(message.error));
+      }
+    };
+
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    worker.postMessage({
+      type: "generate",
+      requestId,
+      prompt,
+      messages,
+      maxNewTokens
+    });
+  });
+}
+
+async function runBrowserGemmaPrompt(
+  prompt: string,
+  modelPrompt: string,
+  messages: AiChatMessage[] | undefined,
+  typedOutput: TypedOutputDescriptor | undefined,
+  results: HTMLElement,
+  effort: EffortLevel,
+  thread?: AiThreadContext
+) {
+  const requestId = crypto.randomUUID();
+  const requestBody = {
+    prompt: modelPrompt,
+    messages,
+    effort,
+    outputSchemaId: typedOutput?.id,
+    maxNewTokens: 1024,
+    model: "google/gemma-4-E2B-it-qat-mobile-transformers",
+    thread: thread
+      ? {
+        parentWindow: thread.parentWindow,
+        turnCount: thread.turns.length
+      }
+      : null
+  };
+
+  results.innerHTML = "";
+  resetRunStatus(results);
+  setRunStatus(results, "ai", "active", undefined, "Gemma", "$0");
+  results.innerHTML = gemmaProgressMarkup("Loading local Gemma 4 WebGPU...");
+
+  let lastText = "";
+  let renderFrame = 0;
+
+  const renderStreamText = () => {
+    renderFrame = 0;
+    results.innerHTML = renderAiText(lastText || " ");
+  };
+
+  return new Promise<void>((resolve) => {
+    const cleanup = () => {
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+      if (renderFrame) {
+        cancelAnimationFrame(renderFrame);
+        renderFrame = 0;
+      }
+    };
+
+    const finishWithError = (message: string) => {
+      cleanup();
+      setRunStatus(results, "ai", "error", undefined, "Gemma", "$0");
+      results.innerHTML = `<div class="status">${escapeHtml(message)}</div>`;
+      resolve();
+    };
+
+    const onError = (event: ErrorEvent) => {
+      finishWithError(event.message || "Local Gemma request failed.");
+    };
+
+    const onMessage = (event: MessageEvent<BrowserGemmaMessage>) => {
+      const message = event.data;
+      if (message.requestId && message.requestId !== requestId) {
+        return;
+      }
+
+      if (message.type === "status") {
+        if (message.status === "loading") {
+          results.innerHTML = gemmaProgressMarkup(message.message, message.progress);
+        } else if (message.status === "generating") {
+          results.innerHTML = `<div class="status">${escapeHtml(message.message)}</div>`;
+        }
+        return;
+      }
+
+      if (message.type === "token") {
+        lastText = message.text;
+        if (!renderFrame) {
+          renderFrame = requestAnimationFrame(renderStreamText);
+        }
+        return;
+      }
+
+      if (message.type === "done") {
+        cleanup();
+        lastText = message.text;
+        results.innerHTML = renderAiText(lastText);
+        assignAiLinkShortcuts(results);
+        setRunStatus(results, "ai", "done", message.elapsedMs, "Gemma", "$0");
+        setEntryDebug(results, {
+          kind: "ai",
+          userPrompt: prompt,
+          expandedPrompt: modelPrompt,
+          typedOutput: typedOutput?.marker ?? null,
+          effort,
+          thread: thread ?? null,
+          modelProviderCall: {
+            provider: message.provider,
+            model: message.model,
+            local: true
+          },
+          apiCall: {
+            url: "/browser-gemma-worker.js",
+            method: "Worker.postMessage",
+            requestBody,
+            responseStatus: "local",
+            responseBody: {
+              text: lastText,
+              elapsedMs: message.elapsedMs,
+              model: message.model,
+              provider: message.provider,
+              cachedAfterFirstLoad: true
+            }
+          }
+        });
+        resolve();
+        return;
+      }
+
+      if (message.type === "error") {
+        finishWithError(message.error);
+      }
+    };
+
+    const worker = getBrowserGemmaWorker();
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    worker.postMessage({
+      type: "generate",
+      requestId,
+      prompt: modelPrompt,
+      messages,
+      maxNewTokens: requestBody.maxNewTokens
+    });
+  });
+}
+
+async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortLevel, thread?: AiThreadContext) {
   results.innerHTML = "";
   resetRunStatus(results);
   setRunStatus(results, "ai", "active");
-  const modelPrompt = expandPromptWithWindowReferences(prompt);
+  const expandedPrompt = expandPromptWithWindowReferences(prompt);
+  const messages = threadMessagesForPrompt(expandedPrompt, thread);
+  const modelPrompt = promptWithThreadFallback(expandedPrompt, messages);
+  const typedOutput = typedOutputReferences(prompt)[0]?.descriptor;
+
+  if (staticMode || aiEngine === "browser-gemma") {
+    await runBrowserGemmaPrompt(prompt, modelPrompt, messages, typedOutput, results, effort, thread);
+    return;
+  }
 
   try {
     const aiRequestBody = {
       prompt: modelPrompt,
+      messages,
       effort,
+      outputSchemaId: typedOutput?.id,
       trigger: {
         type: "keyboard",
         key: "Enter",
@@ -2097,7 +3710,9 @@ async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortL
       kind: "ai",
       userPrompt: prompt,
       expandedPrompt: modelPrompt,
+      typedOutput: typedOutput?.marker ?? null,
       effort,
+      thread: thread ?? null,
       modelProviderCall: providerCallFrom(payload.debug),
       apiCall: {
         url: "/api/ai",
@@ -2115,12 +3730,712 @@ async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortL
     }
 
     setRunStatus(results, "ai", "done", payload.elapsedMs, "AI", aiCallPricing);
-    results.innerHTML = renderAiText(payload.text);
+    results.innerHTML = renderTypedOutput(payload.typedOutput, payload.text);
     assignAiLinkShortcuts(results);
   } catch (error) {
     setRunStatus(results, "ai", "error");
     results.innerHTML = `<div class="status">${escapeHtml(error instanceof Error ? error.message : "AI request failed.")}</div>`;
   }
+}
+
+function encodeWav(chunks: Float32Array[], sampleRate: number) {
+  const sampleCount = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const buffer = new ArrayBuffer(44 + sampleCount * 2);
+  const view = new DataView(buffer);
+  let offset = 0;
+
+  const writeString = (value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset, value.charCodeAt(index));
+      offset += 1;
+    }
+  };
+
+  writeString("RIFF");
+  view.setUint32(offset, 36 + sampleCount * 2, true);
+  offset += 4;
+  writeString("WAVE");
+  writeString("fmt ");
+  view.setUint32(offset, 16, true);
+  offset += 4;
+  view.setUint16(offset, 1, true);
+  offset += 2;
+  view.setUint16(offset, 1, true);
+  offset += 2;
+  view.setUint32(offset, sampleRate, true);
+  offset += 4;
+  view.setUint32(offset, sampleRate * 2, true);
+  offset += 4;
+  view.setUint16(offset, 2, true);
+  offset += 2;
+  view.setUint16(offset, 16, true);
+  offset += 2;
+  writeString("data");
+  view.setUint32(offset, sampleCount * 2, true);
+  offset += 4;
+
+  for (const chunk of chunks) {
+    for (const sample of chunk) {
+      const clamped = Math.max(-1, Math.min(1, sample));
+      view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+type BrowserMoonshineMessage =
+  | { type: "status"; status: string; message: string }
+  | { type: "partial"; text: string }
+  | { type: "final"; text: string }
+  | { type: "done"; text: string }
+  | { type: "error"; error: string };
+
+function setVoiceButtonState(button: HTMLButtonElement, state: "idle" | "loading" | "recording" | "transcribing" | "error") {
+  button.classList.toggle("loading", state === "loading");
+  button.classList.toggle("recording", state === "recording");
+  button.classList.toggle("transcribing", state === "transcribing");
+  button.classList.toggle("error", state === "error");
+  button.disabled = state === "transcribing";
+  button.title = state === "recording"
+    ? "Stop voice input"
+    : state === "loading"
+      ? "Loading browser Moonshine voice model"
+      : state === "transcribing"
+      ? "Transcribing with Moonshine"
+      : state === "error"
+        ? "Voice transcription failed"
+        : `Voice input with ${voiceEngine === "browser" ? "browser Moonshine" : "server Moonshine"}`;
+}
+
+function refreshBrowserMoonshineButtonState() {
+  if (!staticMode && voiceEngine !== "browser") {
+    return;
+  }
+  document.querySelectorAll<HTMLButtonElement>(".voice-button").forEach((button) => {
+    if (button.classList.contains("recording") || button.classList.contains("transcribing")) {
+      return;
+    }
+    if (browserMoonshineStatus === "loading") {
+      setVoiceButtonState(button, "loading");
+    } else if (browserMoonshineStatus === "error") {
+      setVoiceButtonState(button, "error");
+    } else {
+      setVoiceButtonState(button, "idle");
+    }
+  });
+}
+
+function setBrowserMoonshineStatus(status: typeof browserMoonshineStatus, message = "") {
+  const changed = browserMoonshineStatus !== status || browserMoonshineStatusMessage !== message;
+  browserMoonshineStatus = status;
+  browserMoonshineStatusMessage = message;
+  if (changed && status !== "idle") {
+    console.log(`[voice] Moonshine ${status}${message ? `: ${message}` : ""}`);
+  }
+  refreshBrowserMoonshineButtonState();
+}
+
+function getBrowserMoonshineWorker() {
+  if (browserMoonshineWorker && browserMoonshineStatus !== "error") {
+    return browserMoonshineWorker;
+  }
+  if (browserMoonshineWorker) {
+    browserMoonshineWorker.terminate();
+    browserMoonshineWorker = undefined;
+  }
+
+  setBrowserMoonshineStatus("loading", "initializing browser model");
+  browserMoonshineWorker = new Worker("/browser-moonshine-worker.js", { type: "module" });
+  browserMoonshineWorker.addEventListener("message", (event: MessageEvent<BrowserMoonshineMessage>) => {
+    const payload = event.data;
+    if (payload.type === "status" && payload.status === "loading") {
+      setBrowserMoonshineStatus("loading", payload.message);
+    } else if (payload.type === "status" && payload.status === "ready") {
+      setBrowserMoonshineStatus("ready", payload.message);
+    } else if (payload.type === "error") {
+      setBrowserMoonshineStatus("error", payload.error);
+    }
+    browserMoonshineActiveHandler?.(payload);
+  });
+  browserMoonshineWorker.addEventListener("error", (event) => {
+    console.error(event.message);
+    browserMoonshineWorker = undefined;
+    setBrowserMoonshineStatus("error", event.message || "Browser Moonshine failed to load.");
+    browserMoonshineActiveHandler?.({
+      type: "error",
+      error: event.message || "Browser Moonshine failed to load."
+    });
+  });
+  return browserMoonshineWorker;
+}
+
+function preloadBrowserMoonshine() {
+  try {
+    getBrowserMoonshineWorker();
+  } catch (error) {
+    console.error(error);
+    setBrowserMoonshineStatus("error", error instanceof Error ? error.message : "Browser Moonshine failed to load.");
+  }
+}
+
+function closeVoiceMenu() {
+  document.querySelector<HTMLElement>(".voice-menu")?.remove();
+}
+
+function setVoiceEngine(engine: VoiceEngine) {
+  voiceEngine = staticMode ? "browser" : engine;
+  localStorage.setItem("zip.cat.voiceEngine", voiceEngine);
+  if (voiceEngine === "browser") {
+    preloadBrowserMoonshine();
+    return;
+  }
+  document.querySelectorAll<HTMLButtonElement>(".voice-button").forEach((button) => {
+    if (!button.classList.contains("recording") && !button.classList.contains("transcribing")) {
+      setVoiceButtonState(button, "idle");
+    }
+  });
+}
+
+function openVoiceMenu(button: HTMLButtonElement) {
+  closeVoiceMenu();
+  const rect = button.getBoundingClientRect();
+  const menu = document.createElement("div");
+  menu.className = "voice-menu";
+  menu.innerHTML = staticMode
+    ? `
+    <button type="button" data-voice-engine="browser" class="active">
+      <span>browser</span>
+      <span>Transformers.js Moonshine WebGPU/WASM</span>
+    </button>
+  `
+    : `
+    <button type="button" data-voice-engine="server" class="${voiceEngine === "server" ? "active" : ""}">
+      <span>server</span>
+      <span>local Python Moonshine stream</span>
+    </button>
+    <button type="button" data-voice-engine="browser" class="${voiceEngine === "browser" ? "active" : ""}">
+      <span>browser</span>
+      <span>Transformers.js Moonshine WebGPU/WASM</span>
+    </button>
+  `;
+  menu.style.left = `${Math.min(rect.left, window.innerWidth - 300)}px`;
+  menu.style.top = `${rect.bottom + 6}px`;
+  menu.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const option = target.closest<HTMLButtonElement>("[data-voice-engine]");
+    if (!option) {
+      return;
+    }
+    setVoiceEngine(option.dataset.voiceEngine === "browser" ? "browser" : "server");
+    closeVoiceMenu();
+  });
+  document.body.append(menu);
+}
+
+function insertVoiceText(input: CommandField, text: string) {
+  const transcriptText = text.trim();
+  if (!transcriptText) {
+    return;
+  }
+
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  const needsLeadingSpace = start > 0 && !/\s$/.test(input.value.slice(0, start));
+  const needsTrailingSpace = end < input.value.length && !/^\s/.test(input.value.slice(end));
+  const insert = `${needsLeadingSpace ? " " : ""}${transcriptText}${needsTrailingSpace ? " " : ""}`;
+  input.setRangeText(insert, start, end, "end");
+  resizeCommandField(input);
+  updateCommandHighlight(input);
+  updateSlashCommandControls(input);
+  scheduleSuggest(input);
+  input.focus();
+}
+
+function voiceWebSocketUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/voice/stream`;
+}
+
+function pcm16FromFloat32(samples: Float32Array) {
+  const pcm = new Int16Array(samples.length);
+  for (let index = 0; index < samples.length; index += 1) {
+    const clamped = Math.max(-1, Math.min(1, samples[index]));
+    pcm[index] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+  }
+  return pcm;
+}
+
+function base64FromArrayBuffer(buffer: ArrayBufferLike) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function flushVoiceAudio(state: VoiceRecorderState) {
+  if (!state.socket || state.pendingPcm.length === 0 || state.socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  const sampleCount = state.pendingPcm.reduce((total, chunk) => total + chunk.length, 0);
+  const merged = new Int16Array(sampleCount);
+  let offset = 0;
+  for (const chunk of state.pendingPcm.splice(0)) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  state.socket.send(JSON.stringify({
+    type: "audio",
+    sampleRate: state.context.sampleRate,
+    audio: base64FromArrayBuffer(merged.buffer)
+  }));
+}
+
+function updateStreamingVoiceText(state: VoiceRecorderState, text: string) {
+  const transcriptText = text.trim();
+  const before = state.input.value.slice(0, state.insertStart);
+  const after = state.input.value.slice(state.insertEnd);
+  const needsLeadingSpace = Boolean(transcriptText && before && !/\s$/.test(before));
+  const needsTrailingSpace = Boolean(transcriptText && after && !/^\s/.test(after));
+  const replacement = transcriptText
+    ? `${needsLeadingSpace ? " " : ""}${transcriptText}${needsTrailingSpace ? " " : ""}`
+    : "";
+
+  state.input.value = `${before}${replacement}${after}`;
+  state.insertEnd = state.insertStart + replacement.length;
+  state.input.setSelectionRange(state.insertEnd, state.insertEnd);
+  resizeCommandField(state.input);
+  updateCommandHighlight(state.input);
+  updateSlashCommandControls(state.input);
+  scheduleSuggest(state.input);
+  state.input.focus();
+}
+
+async function createVoiceCaptureNode(
+  context: AudioContext,
+  onAudio: (samples: Float32Array) => void
+) {
+  if (context.audioWorklet) {
+    const source = `class ZipCatVoiceCapture extends AudioWorkletProcessor {
+      process(inputs, outputs) {
+        const input = inputs[0] && inputs[0][0];
+        const output = outputs[0] && outputs[0][0];
+        if (output) output.fill(0);
+        if (input && input.length) {
+          const copy = new Float32Array(input.length);
+          copy.set(input);
+          this.port.postMessage(copy.buffer, [copy.buffer]);
+        }
+        return true;
+      }
+    }
+    registerProcessor("zip-cat-voice-capture", ZipCatVoiceCapture);`;
+    const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    try {
+      await context.audioWorklet.addModule(url);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    const node = new AudioWorkletNode(context, "zip-cat-voice-capture", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1]
+    });
+    node.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+      onAudio(new Float32Array(event.data));
+    };
+    return node;
+  }
+
+  const processor = context.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (event) => {
+    onAudio(new Float32Array(event.inputBuffer.getChannelData(0)));
+  };
+  return processor;
+}
+
+async function startVoiceRecording(button: HTMLButtonElement, input: CommandField) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setVoiceButtonState(button, "error");
+    throw new Error("Microphone capture is not available in this browser.");
+  }
+
+  const AudioContextConstructor = window.AudioContext
+    ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextConstructor) {
+    setVoiceButtonState(button, "error");
+    throw new Error("Audio capture is not available in this browser.");
+  }
+
+  const selectedEngine = staticMode ? "browser" : voiceEngine;
+  const socket = selectedEngine === "server" ? new WebSocket(voiceWebSocketUrl()) : undefined;
+  const worker = selectedEngine === "browser"
+    ? getBrowserMoonshineWorker()
+    : undefined;
+  if (selectedEngine === "browser" && browserMoonshineStatus === "loading") {
+    setVoiceButtonState(button, "loading");
+  }
+
+  if (socket) {
+    await new Promise<void>((resolve, reject) => {
+      socket.addEventListener("open", () => resolve(), { once: true });
+      socket.addEventListener("error", () => reject(new Error("Voice stream could not connect.")), { once: true });
+    });
+  }
+
+  let recorderState: VoiceRecorderState | undefined;
+  const handleVoiceMessage = (payload: BrowserMoonshineMessage | { type?: string; status?: string; text?: string; error?: string; detail?: string }) => {
+    if (payload.type === "status" && payload.status === "loading") {
+      setVoiceButtonState(button, "loading");
+      return;
+    }
+    if (!recorderState) {
+      return;
+    }
+    if (payload.type === "partial" || payload.type === "final") {
+      updateStreamingVoiceText(recorderState, payload.text ?? "");
+    } else if (payload.type === "done") {
+      updateStreamingVoiceText(recorderState, payload.text ?? "");
+      recorderState.socket?.close();
+      if (recorderState.engine === "browser") {
+        browserMoonshineActiveHandler = undefined;
+      } else {
+        recorderState.worker?.terminate();
+      }
+      setVoiceButtonState(button, "idle");
+    } else if (payload.type === "status" && payload.status === "loading") {
+      setVoiceButtonState(button, "transcribing");
+    } else if (payload.type === "status" && (payload.status === "ready" || payload.status === "recording")) {
+      setVoiceButtonState(button, "recording");
+    } else if (payload.type === "error") {
+      const detail = "detail" in payload ? payload.detail : undefined;
+      console.error(detail ? `${payload.error}: ${detail}` : payload.error ?? "Voice transcription failed.");
+      setVoiceButtonState(button, "error");
+      window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
+      recorderState.socket?.close();
+      if (recorderState.engine === "browser") {
+        browserMoonshineActiveHandler = undefined;
+      } else {
+        recorderState.worker?.terminate();
+      }
+    }
+  };
+
+  socket?.addEventListener("message", (event) => {
+    if (typeof event.data === "string") {
+      handleVoiceMessage(JSON.parse(event.data) as { type?: string; text?: string; error?: string; detail?: string });
+    }
+  });
+  socket?.addEventListener("error", () => {
+    if (recorderState) {
+      setVoiceButtonState(button, "error");
+      window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
+    }
+  });
+  socket?.addEventListener("close", () => {
+    if (recorderState && button.classList.contains("transcribing")) {
+      setVoiceButtonState(button, "idle");
+    }
+  });
+  if (selectedEngine === "browser") {
+    browserMoonshineActiveHandler = handleVoiceMessage;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true
+      }
+    });
+    const context = new AudioContextConstructor(selectedEngine === "browser"
+      ? {
+        sampleRate: 16000,
+        latencyHint: "interactive"
+      }
+      : undefined);
+    await context.resume();
+    const source = context.createMediaStreamSource(stream);
+    const pendingPcm: Int16Array[] = [];
+    const captureNode = await createVoiceCaptureNode(context, (samples) => {
+      if (recorderState?.engine === "server") {
+        pendingPcm.push(pcm16FromFloat32(samples));
+      } else {
+        recorderState?.worker?.postMessage({
+          type: "audio",
+          buffer: samples
+        }, [samples.buffer]);
+      }
+    });
+    source.connect(captureNode);
+    captureNode.connect(context.destination);
+    const insertStart = input.selectionStart ?? input.value.length;
+    const insertEnd = input.selectionEnd ?? insertStart;
+
+    recorderState = {
+      engine: selectedEngine,
+      button,
+      input,
+      stream,
+      context,
+      source,
+      captureNode,
+      socket,
+      worker,
+      pendingPcm,
+      flushInterval: window.setInterval(() => {
+        if (recorderState?.engine === "server") {
+          flushVoiceAudio(recorderState);
+        }
+      }, 90),
+      insertStart,
+      insertEnd,
+      timeout: window.setTimeout(() => {
+        void stopVoiceRecording(activeVoiceRecorder);
+      }, 30_000)
+    };
+    activeVoiceRecorder = recorderState;
+    socket?.send(JSON.stringify({
+      type: "start",
+      sampleRate: context.sampleRate
+    }));
+    worker?.postMessage({ type: "reset" });
+    setVoiceButtonState(button, selectedEngine === "browser" && browserMoonshineStatus === "loading" ? "loading" : "recording");
+  } catch (error) {
+    socket?.close();
+    if (selectedEngine === "browser") {
+      browserMoonshineActiveHandler = undefined;
+    } else {
+      worker?.terminate();
+    }
+    throw error;
+  }
+}
+
+async function stopVoiceRecording(state = activeVoiceRecorder) {
+  if (!state) {
+    return;
+  }
+
+  if (activeVoiceRecorder === state) {
+    activeVoiceRecorder = undefined;
+  }
+
+  window.clearTimeout(state.timeout);
+  window.clearInterval(state.flushInterval);
+  flushVoiceAudio(state);
+  state.captureNode.disconnect();
+  state.source.disconnect();
+  state.stream.getTracks().forEach((track) => track.stop());
+  await state.context.close();
+
+  try {
+    setVoiceButtonState(state.button, "transcribing");
+    if (state.engine === "browser") {
+      state.worker?.postMessage({ type: "stop" });
+      window.setTimeout(() => {
+        if (state.button.classList.contains("transcribing")) {
+          setVoiceButtonState(state.button, "idle");
+          if (browserMoonshineActiveHandler) {
+            browserMoonshineActiveHandler = undefined;
+          }
+        }
+      }, 5000);
+    } else if (state.socket?.readyState === WebSocket.OPEN) {
+      state.socket.send(JSON.stringify({ type: "stop" }));
+      window.setTimeout(() => {
+        if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
+          state.socket.close();
+        }
+        if (state.button.classList.contains("transcribing")) {
+          setVoiceButtonState(state.button, "idle");
+        }
+      }, 3000);
+    } else {
+      setVoiceButtonState(state.button, "idle");
+    }
+  } catch (error) {
+    console.error(error);
+    setVoiceButtonState(state.button, "error");
+    window.setTimeout(() => setVoiceButtonState(state.button, "idle"), 1800);
+  }
+}
+
+async function toggleVoiceRecordingForButton(button: HTMLButtonElement) {
+  const form = button.closest<HTMLFormElement>("form");
+  const voiceInput = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+  if (!voiceInput) {
+    return;
+  }
+  focusCommandInput(voiceInput);
+
+  if (activeVoiceRecorder?.button === button) {
+    await stopVoiceRecording(activeVoiceRecorder);
+    focusCommandInput(voiceInput);
+    return;
+  }
+
+  if (activeVoiceRecorder) {
+    await stopVoiceRecording(activeVoiceRecorder);
+  }
+
+  try {
+    await startVoiceRecording(button, voiceInput);
+  } catch (error) {
+    console.error(error);
+    window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
+  }
+}
+
+function voiceButtonForInput(searchInput: CommandField | undefined) {
+  const block = searchInput?.closest<HTMLElement>(".entry, .current-command");
+  return block?.querySelector<HTMLButtonElement>(".voice-button");
+}
+
+function activeVoiceButton() {
+  return voiceButtonForInput(activeSearchInput())
+    ?? voiceButtonForInput(input ?? undefined)
+    ?? document.querySelector<HTMLButtonElement>(".voice-button")
+    ?? undefined;
+}
+
+function isOptionSpace(event: KeyboardEvent) {
+  return event.altKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.shiftKey &&
+    !event.isComposing &&
+    event.code === "Space";
+}
+
+function bindVoiceButtons(root: ParentNode = document) {
+  root.querySelectorAll<HTMLButtonElement>(".voice-button").forEach((button) => {
+    if (button.dataset.voiceBound === "true") {
+      return;
+    }
+    button.dataset.voiceBound = "true";
+    let clickTimer: number | undefined;
+    button.addEventListener("mousedown", (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      const form = button.closest<HTMLFormElement>("form");
+      const voiceInput = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+      if (!voiceInput) {
+        return;
+      }
+      const selection = selectionForCommandInput(voiceInput);
+      event.preventDefault();
+      focusCommandInput(voiceInput, selection);
+    });
+    button.addEventListener("click", () => {
+      window.clearTimeout(clickTimer);
+      clickTimer = window.setTimeout(() => {
+        void toggleVoiceRecordingForButton(button);
+      }, 220);
+    });
+    button.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      window.clearTimeout(clickTimer);
+      openVoiceMenu(button);
+    });
+  });
+}
+
+function latestAiEntry() {
+  return Array.from(document.querySelectorAll<HTMLElement>(".entry[data-mode='ai']")).at(-1);
+}
+
+function threadHasAncestor(entry: HTMLElement, ancestorId: string) {
+  let parentId = entry.dataset.threadParent;
+  const seen = new Set<string>();
+  while (parentId && !seen.has(parentId)) {
+    if (parentId === ancestorId) {
+      return true;
+    }
+    seen.add(parentId);
+    parentId = entryForThreadId(parentId)?.dataset.threadParent;
+  }
+  return false;
+}
+
+function lastThreadRow(parentEntry: HTMLElement) {
+  const parentId = ensureEntryThreadId(parentEntry);
+  let last = entryRow(parentEntry);
+  document.querySelectorAll<HTMLElement>(".entry").forEach((entry) => {
+    if (entry === parentEntry || threadHasAncestor(entry, parentId)) {
+      last = entryRow(entry) ?? last;
+    }
+  });
+  return last;
+}
+
+function nextPaint() {
+  return new Promise<void>((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+function restoreParentPromptForThread(parentEntry: HTMLElement, searchInput: CommandField) {
+  const originalPrompt = aiPromptForEntry(parentEntry);
+  if (!originalPrompt || searchInput.value.trim() === originalPrompt) {
+    return;
+  }
+
+  searchInput.value = originalPrompt;
+  parentEntry.dataset.originalQuery = originalPrompt;
+  resizeCommandField(searchInput);
+  updateCommandHighlight(searchInput);
+}
+
+async function createThreadedAiEntry(query: string, effort: EffortLevel, parentEntry?: HTMLElement) {
+  if (!transcript) {
+    return;
+  }
+
+  const parentId = parentEntry ? ensureEntryThreadId(parentEntry) : undefined;
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = renderEntry(query, "", "ai", effort, {}, parentId);
+  const node = wrapper.firstElementChild;
+  if (!(node instanceof HTMLElement)) {
+    return;
+  }
+
+  if (parentEntry && parentId) {
+    const entry = node.querySelector<HTMLElement>(".entry");
+    if (entry) {
+      setEntryThreadParent(entry, parentId);
+    }
+    lastThreadRow(parentEntry)?.after(node);
+  } else {
+    transcript.append(node);
+  }
+
+  renumberStatusLabels();
+  node.querySelectorAll<CommandField>(".entry-input").forEach(bindSuggestionInput);
+  bindVoiceButtons(node);
+
+  const results = node.querySelector<HTMLElement>(".results");
+  if (!results) {
+    return;
+  }
+
+  const thread = parentEntry ? aiThreadContext(parentEntry) : undefined;
+  node.scrollIntoView({
+    block: "start"
+  });
+  await nextPaint();
+  await runAiPrompt(query, results, effort, thread);
 }
 
 document.addEventListener("submit", async (event) => {
@@ -2134,6 +4449,8 @@ document.addEventListener("submit", async (event) => {
   }
 
   event.preventDefault();
+  const isThreadSubmit = submittedForm.dataset.threadSubmit === "true";
+  delete submittedForm.dataset.threadSubmit;
 
   const searchInput = submittedForm.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
   const query = searchInput?.value.trim() ?? "";
@@ -2145,7 +4462,15 @@ document.addEventListener("submit", async (event) => {
     const entry = submittedForm.closest<HTMLElement>(".entry");
     const results = entry?.querySelector<HTMLElement>(".results");
     const entryEffort = Math.min(Math.max(Number(entry?.dataset.effort ?? 3), 1), 5) as EffortLevel;
+    if (isThreadSubmit && entry?.dataset.mode === "ai") {
+      restoreParentPromptForThread(entry, searchInput);
+      await createThreadedAiEntry(query, entryEffort, entry);
+      return;
+    }
     if (results) {
+      if (entry) {
+        entry.dataset.originalQuery = query;
+      }
       if (slashCommandForQuery(query)) {
         await runSlashCommand(query, results, searchInput);
       } else if (entry?.dataset.mode === "ai") {
@@ -2162,6 +4487,22 @@ document.addEventListener("submit", async (event) => {
   const submittedEffort = effortLevel;
   const submittedSlashCommand = slashCommandForQuery(query);
   const submittedSlashArgs = submittedSlashCommand ? collectSlashArgs(searchInput, submittedSlashCommand) : {};
+
+  if (isThreadSubmit && submittedMode === "ai") {
+    const parentEntry = latestAiEntry();
+    await createThreadedAiEntry(query, submittedEffort, parentEntry);
+    searchInput.value = "";
+    resizeCommandField(searchInput);
+    updateCommandHighlight(searchInput);
+    updateSlashCommandControls(searchInput);
+    clearSuggestionsFor(searchInput);
+    suggestAbort?.abort();
+    setCommandMode(submittedMode);
+    searchInput.focus();
+    scrollToPrompt();
+    return;
+  }
+
   const entry = document.createElement("div");
   entry.innerHTML = renderEntry(query, "", submittedMode, submittedEffort, submittedSlashArgs);
   const node = entry.firstElementChild;
@@ -2175,6 +4516,7 @@ document.addEventListener("submit", async (event) => {
   transcript.append(node);
   renumberStatusLabels();
   node.querySelectorAll<CommandField>(".entry-input").forEach(bindSuggestionInput);
+  bindVoiceButtons(node);
   const persistedSuggestions = node.querySelector<HTMLElement>(".query-suggestions");
   if (persistedSuggestions) {
     persistedSuggestions.innerHTML = currentSuggestionHtml;

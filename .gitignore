@@ -1,5 +1,9 @@
 .next/
+dist/
+evals/results/
 node_modules/
+.venv/
+.moonshine-cache/
 *.log
 .env
 .env.local

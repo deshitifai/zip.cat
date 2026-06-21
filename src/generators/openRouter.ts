@@ -1,4 +1,4 @@
-import type { EffortLevel } from "../models";
+import type { AiChatMessage, EffortLevel } from "../models";
 import {
   AiGenerator,
   type AiGenerateRequest,
@@ -14,6 +14,19 @@ type ChatCompletionResponse = {
       content?: string;
     };
   }>;
+};
+
+type OpenRouterRequestBody = {
+  model: string;
+  messages: AiChatMessage[];
+  response_format?: {
+    type: "json_schema";
+    json_schema: {
+      name: string;
+      strict: boolean;
+      schema: Record<string, unknown>;
+    };
+  };
 };
 
 function parseOpenRouterJson(text: string, status: number) {
@@ -74,31 +87,69 @@ export abstract class OpenRouterAiGenerator extends GenericAiGenerator {
       throw new Error("OPENROUTER_API_KEY is not configured.");
     }
 
-    const requestBody = {
-      model: this.configuredModel,
-      messages: [
+    const chatMessages = request.messages?.length
+      ? [
+        ...(request.system
+          ? [{
+            role: "system" as const,
+            content: request.system
+          }]
+          : []),
+        ...request.messages
+      ]
+      : [
         {
-          role: "system",
-          content: "Answer directly and concisely."
+          role: "system" as const,
+          content: request.system ?? "Answer directly and concisely."
         },
         {
-          role: "user",
+          role: "user" as const,
           content: request.prompt
         }
-      ]
-    };
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "authorization": `Bearer ${apiKey}`,
-        "content-type": "application/json",
-        "http-referer": "https://zip.cat",
-        "x-title": "zip.cat"
-      },
-      body: JSON.stringify(requestBody)
+      ];
+
+    const makeRequestBody = (includeResponseSchema: boolean): OpenRouterRequestBody => ({
+      model: this.configuredModel,
+      messages: chatMessages,
+      ...(includeResponseSchema && request.responseSchema
+        ? {
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: request.responseSchema.name.replace(/[^A-Za-z0-9_-]/g, "_"),
+              strict: false,
+              schema: request.responseSchema.schema
+            }
+          }
+        }
+        : {})
     });
 
-    const payload = parseOpenRouterJson(await response.text(), response.status);
+    const callProvider = async (requestBody: OpenRouterRequestBody) => {
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "authorization": `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "http-referer": "https://zip.cat",
+          "x-title": "zip.cat"
+        },
+        body: JSON.stringify(requestBody)
+      });
+      return {
+        response,
+        payload: parseOpenRouterJson(await response.text(), response.status),
+        requestBody
+      };
+    };
+
+    let attempt = await callProvider(makeRequestBody(Boolean(request.responseSchema)));
+    const attempts = [attempt];
+    if (!attempt.response.ok && request.responseSchema) {
+      attempt = await callProvider(makeRequestBody(false));
+      attempts.push(attempt);
+    }
+
     const debug = {
       providerCall: {
         url: "https://openrouter.ai/api/v1/chat/completions",
@@ -108,26 +159,37 @@ export abstract class OpenRouterAiGenerator extends GenericAiGenerator {
           "http-referer": "https://zip.cat",
           "x-title": "zip.cat"
         },
-        requestBody,
-        responseStatus: response.status,
-        responseBody: payload
-      }
+        requestBody: attempt.requestBody,
+        responseStatus: attempt.response.status,
+        responseBody: attempt.payload
+      },
+      attempts: attempts.map((item) => ({
+        requestBody: item.requestBody,
+        responseStatus: item.response.status,
+        responseBody: item.payload
+      }))
     };
 
-    if (!response.ok) {
-      throw new Error(payload.error?.message ?? `AI request failed with ${response.status}.`);
+    if (!attempt.response.ok) {
+      const messages = attempts
+        .map((item) => {
+          const message = item.payload.error?.message ?? "AI request failed.";
+          return `OpenRouter ${item.requestBody.model} failed with ${item.response.status}: ${message}`;
+        })
+        .filter(Boolean);
+      throw new Error([...new Set(messages)].join(" Then fallback failed: "));
     }
 
-    const text = payload.choices?.[0]?.message?.content?.trim();
+    const text = attempt.payload.choices?.[0]?.message?.content?.trim();
     if (!text) {
       throw new Error("AI response was empty.");
     }
 
     return {
       text,
-      model: payload.model ?? this.configuredModel,
+      model: attempt.payload.model ?? this.configuredModel,
       provider: this.provider,
-      usage: payload.usage,
+      usage: attempt.payload.usage,
       debug
     };
   }
@@ -170,13 +232,13 @@ export class OpenRouterGpt41Generator extends OpenRouterAiGenerator {
     ?? "openai/gpt-4.1";
 }
 
-export class OpenRouterGpt55Generator extends OpenRouterAiGenerator {
-  readonly id = "openrouter.ai.gpt-5.5";
-  readonly name = "OpenRouter GPT-5.5";
+export class OpenRouterGpt41HighGenerator extends OpenRouterAiGenerator {
+  readonly id = "openrouter.ai.gpt-4.1-high";
+  readonly name = "OpenRouter GPT-4.1 High";
   readonly effort = 5;
   protected readonly configuredModel = process.env.AI_MODEL_EFFORT_5
     ?? process.env.OPENROUTER_MODEL_EFFORT_5
-    ?? "openai/gpt-5.5-20260423";
+    ?? "openai/gpt-4.1";
 }
 
 export function createOpenRouterAiGenerators() {
@@ -185,7 +247,7 @@ export function createOpenRouterAiGenerators() {
     new OpenRouterGpt41MiniGenerator(),
     new OpenRouterAutoGenerator(),
     new OpenRouterGpt41Generator(),
-    new OpenRouterGpt55Generator()
+    new OpenRouterGpt41HighGenerator()
   ];
 }
 
