@@ -143,10 +143,26 @@ Current command:
 
 It uses Open-Meteo and renders current conditions plus a short forecast.
 
+`/lanes` logs into The Canon Club (Clubspot) and lists your next five days of
+swim-lane reservations. It is server-only and reads `CANON_POOL_LOGIN` /
+`CANON_POOL_PASSWORD` from the environment.
+
 ![Weather slash command](docs/images/zipcat-weather.jpg)
 
 Type `/` at the start of the prompt to see command ghost text. `Tab` accepts a
 suggestion. Wikipedia/Wiktionary suggestions are disabled for slash commands.
+
+### Caching
+
+Any slash command (or plugin) can opt into schema-based browser caching by
+declaring a `cache` TTL on its descriptor. Output is stored in `localStorage`,
+keyed by command + arguments, and validated against the command's `outputSchema`
+on every read — a changed schema or malformed payload is discarded and refetched.
+
+Within the TTL the cached result is served instantly with no network call. The
+result view shows an age chip (`now` / `15m` / `3h` / `4h`) and a refresh button
+(`↻`) in the upper-right that forces a fresh run. `/lanes` defaults to a 4-hour
+TTL.
 
 ## Voice
 

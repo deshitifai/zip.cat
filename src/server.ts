@@ -2,6 +2,7 @@ import { Elysia, t } from "elysia";
 import { aiEffortConfig, answer, resolveInlineInference, shapeSearchResults } from "./ai";
 import { loadEnv } from "./env";
 import { renderPage } from "./render";
+import { renderDocsPage } from "./docs";
 import { search } from "./search";
 import { suggest } from "./suggest";
 import { createWebSearchGenerators } from "./generators/webSearch";
@@ -133,6 +134,7 @@ const app = new Elysia()
       "cache-control": "public, max-age=31536000, immutable"
     }
   }))
+  .get("/docs", () => html(renderDocsPage()))
   .get("/", async ({ query }) => {
     const q = typeof query.q === "string" ? query.q : "";
     if (!q.trim()) {

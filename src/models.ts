@@ -118,7 +118,7 @@ export interface SuggestionPlacement {
 
 export interface SlashCommandPlacement {
   target: "results";
-  renderer: "weather-card" | "json";
+  renderer: "weather-card" | "lanes-card" | "json";
 }
 
 export interface SuggestPluginResultSet {
@@ -200,6 +200,11 @@ export interface SlashCommandArgument {
   }>;
 }
 
+export interface CacheDescriptor {
+  // TTL in milliseconds before cached output is treated as stale and refreshed.
+  ttlMs: number;
+}
+
 export interface SlashCommandDescriptor {
   id: string;
   name: string;
@@ -208,6 +213,9 @@ export interface SlashCommandDescriptor {
   arguments: SlashCommandArgument[];
   placement: SlashCommandPlacement;
   outputSchema: JsonSchema;
+  // Optional: when set, the command's output is cached in the browser keyed by
+  // command + args, validated against `outputSchema`, and served within this TTL.
+  cache?: CacheDescriptor;
 }
 
 export interface SlashCommandRequest {
