@@ -2,7 +2,13 @@ import { marked } from "marked";
 import { wikipediaTitlePlugin } from "./plugins/wikipediaTitle";
 import { wiktionaryHeadwordPlugin } from "./plugins/wiktionaryHeadword";
 import { suggest as runLocalSuggest } from "./suggest";
-import { runSlashCommand as executeStaticSlashCommand, slashCommandDescriptors } from "./slash/registry";
+import {
+  runSlashCommand as executeStaticSlashCommand,
+  slashCommandDescriptors,
+  detectImplicitCommand,
+  completeImplicitInput
+} from "./slash/registry";
+import { createSlashContext } from "./slash/base";
 import { typedOutputDescriptors } from "./typedOutputs";
 import { type CacheHit, formatAge, readCache, writeCache } from "./cache";
 
@@ -430,7 +436,9 @@ function updateCommandHighlight(searchInput: CommandField, inlineActive = false)
   const hasInlineGlow = inlineActive && inlineInferenceSpans(searchInput.value).length > 0;
   const mode: CommandMode = block.dataset.mode === "ai" ? "ai" : "search";
   const typedGhostText = typedOutputGhostText(searchInput.value);
-  const ghostText = typedGhostText || (mode === "search" ? slashCommandGhostText(searchInput.value) : "");
+  const ghostText = typedGhostText
+    || (mode === "search" ? slashCommandGhostText(searchInput.value) : "")
+    || (mode === "search" ? implicitGhostText(searchInput.value) : "");
   const hasTypedOutputRef = typedOutputReferences(searchInput.value).length > 0;
   if (!hasValidWindowRef && !hasInlineGlow && !ghostText && !hasTypedOutputRef) {
     block.classList.remove("command-highlight-active");
@@ -609,6 +617,7 @@ let activeWindowReferenceTarget: HTMLElement | undefined;
 let effortMenuContext: EffortContext | undefined;
 let suggestSuppressedUntil = 0;
 const debugPayloads = new WeakMap<HTMLElement, DebugPayload>();
+const aiRunQueues = new WeakMap<HTMLElement, Promise<void>>();
 
 function normalizeEffortLevel(level: number) {
   return Math.min(Math.max(Math.round(level), 1), 5) as EffortLevel;
@@ -736,6 +745,42 @@ function acceptSlashCommandGhost(searchInput: CommandField) {
   slashControlsForInput(searchInput)
     ?.querySelector<HTMLInputElement>("[data-slash-arg]")
     ?.focus();
+  return true;
+}
+
+// Ghost suffix for an implicit (no-slash) autocomplete — e.g. typing "12 in "
+// shows a faded "in ft" the user can accept with Tab to get "12 in in ft".
+// Driven by the same static completeImplicitInput the eval library tests.
+function implicitCompletionFor(query: string): string | undefined {
+  if (!query.trim() || isSlashCommandInput(query)) {
+    return undefined;
+  }
+  const completed = completeImplicitInput(query);
+  if (!completed || !completed.startsWith(query)) {
+    return undefined;
+  }
+  return completed;
+}
+
+function implicitGhostText(query: string): string {
+  const completed = implicitCompletionFor(query);
+  if (!completed) {
+    return "";
+  }
+  const suffix = completed.slice(query.length);
+  return suffix || "";
+}
+
+function acceptImplicitGhost(searchInput: CommandField) {
+  const completed = implicitCompletionFor(searchInput.value);
+  if (!completed || completed === searchInput.value) {
+    return false;
+  }
+  searchInput.value = completed;
+  resizeCommandField(searchInput);
+  updateCommandHighlight(searchInput);
+  scheduleSuggest(searchInput);
+  updateImplicitResult(searchInput);
   return true;
 }
 
@@ -2119,13 +2164,100 @@ function renderLanesCard(output: unknown) {
       lane?: string;
       who?: string;
     }>;
+    availableOpenings?: Array<{
+      date?: string;
+      weekday?: string;
+      startTime?: string;
+      endTime?: string;
+      lanes?: string[];
+    }>;
+    days?: Array<{
+      date?: string;
+      weekday?: string;
+      reservations?: Array<{
+        date?: string;
+        weekday?: string;
+        startTime?: string;
+        endTime?: string;
+        lane?: string;
+        who?: string;
+      }>;
+      availableOpenings?: Array<{
+        date?: string;
+        weekday?: string;
+        startTime?: string;
+        endTime?: string;
+        lanes?: string[];
+      }>;
+    }>;
     source?: { name?: string };
   };
   const reservations = lanes.reservations ?? [];
+  const openings = lanes.availableOpenings ?? [];
+  const days = lanes.days ?? [];
   const windowDays = typeof lanes.windowDays === "number" ? lanes.windowDays : 5;
   const heading = `${escapeHtml(lanes.club ?? "Swim lanes")} · next ${windowDays} days`;
+  const renderOpening = (opening: { startTime?: string; endTime?: string; lanes?: string[] }) => {
+    const laneCount = opening.lanes?.length ?? 0;
+    const laneLabel = laneCount === 1 ? opening.lanes?.[0] ?? "1 lane" : `${laneCount} lanes`;
+    return `<span class="lanes-open-time" title="${escapeHtml((opening.lanes ?? []).join(", "))}">
+      ${escapeHtml([opening.startTime, opening.endTime].filter(Boolean).join("–"))}
+      <span>${escapeHtml(laneLabel)}</span>
+    </span>`;
+  };
+
+  if (days.length > 0) {
+    const dayRows = days.map((day) => {
+      const dayLabel = [day.weekday, day.date].filter(Boolean).join(" ") || "—";
+      const dayReservations = day.reservations ?? [];
+      const dayOpenings = day.availableOpenings ?? [];
+      const content = dayReservations.length > 0
+        ? `<ul class="lanes-list">${dayReservations.map((reservation) => {
+          const time = [reservation.startTime, reservation.endTime].filter(Boolean).join("–");
+          return `<li class="lanes-row lanes-row-compact">
+            <span class="lanes-time">${escapeHtml(time || "—")}</span>
+            <span class="lanes-lane">${escapeHtml(reservation.lane ?? "Lane")}</span>
+            <span class="lanes-who">${escapeHtml(reservation.who ?? "")}</span>
+          </li>`;
+        }).join("")}</ul>`
+        : dayOpenings.length > 0
+          ? `<div class="lanes-open-times">${dayOpenings.map(renderOpening).join("")}</div>`
+          : `<div class="lanes-none">None available</div>`;
+      return `<div class="lanes-open-day">
+        <div class="lanes-open-date">${escapeHtml(dayLabel)}</div>
+        ${content}
+      </div>`;
+    }).join("");
+
+    return `<section class="lanes-card">
+      <div class="lanes-heading">${heading}</div>
+      <div class="lanes-open-list">${dayRows}</div>
+      <div class="lanes-source">${escapeHtml(lanes.source?.name ?? "Clubspot")}</div>
+    </section>`;
+  }
 
   if (reservations.length === 0) {
+    if (openings.length > 0) {
+      const groupedOpenings = new Map<string, typeof openings>();
+      openings.forEach((opening) => {
+        const day = [opening.weekday, opening.date].filter(Boolean).join(" ") || "Open";
+        groupedOpenings.set(day, [...(groupedOpenings.get(day) ?? []), opening]);
+      });
+      const openingRows = [...groupedOpenings.entries()].map(([day, dayOpenings]) => (
+        `<div class="lanes-open-day">
+          <div class="lanes-open-date">${escapeHtml(day)}</div>
+          <div class="lanes-open-times">
+            ${dayOpenings.map(renderOpening).join("")}
+          </div>
+        </div>`
+      )).join("");
+      return `<section class="lanes-card">
+        <div class="lanes-heading">${heading}</div>
+        <div class="lanes-empty">No swim-lane reservations. Open times:</div>
+        <div class="lanes-open-list">${openingRows}</div>
+        <div class="lanes-source">${escapeHtml(lanes.source?.name ?? "Clubspot")}</div>
+      </section>`;
+    }
     return `<section class="lanes-card">
       <div class="lanes-heading">${heading}</div>
       <div class="lanes-empty">No swim-lane reservations.</div>
@@ -2313,6 +2445,127 @@ function clearSuggestionsFor(searchInput: CommandField) {
   suggestionContextFor(searchInput)?.replaceChildren();
 }
 
+// Token that owns the most recent async implicit render per input, so a slower
+// in-flight render can't overwrite a newer one (last write wins by recency).
+const implicitRenderToken = new WeakMap<CommandField, number>();
+let implicitRenderCounter = 0;
+
+// The implicit result has its OWN container (a sibling of the suggestion aside),
+// so the suggest pipeline's clearing of `.query-suggestions` can't wipe it. Lazily
+// created per query-row on first use.
+function implicitContainerFor(searchInput: CommandField): HTMLElement | undefined {
+  const row = searchInput.closest<HTMLElement>(".query-row");
+  if (!row) {
+    return undefined;
+  }
+  let container = row.querySelector<HTMLElement>(".implicit-results");
+  if (!container) {
+    container = document.createElement("aside");
+    container.className = "implicit-results";
+    const suggestions = row.querySelector(".query-suggestions");
+    if (suggestions) {
+      suggestions.after(container);
+    } else {
+      row.append(container);
+    }
+  }
+  return container;
+}
+
+function clearImplicitResult(searchInput: CommandField) {
+  const row = searchInput.closest<HTMLElement>(".query-row");
+  row?.querySelector(".implicit-results")?.replaceChildren();
+}
+
+// Inline-live implicit pickups: as the user types a bare formula / conversion /
+// ticker (no leading slash), surface the result beneath the input with NO
+// network for offline commands and NO Enter required. Pure client-side, driven
+// by the same static detectors the eval library tests.
+function updateImplicitResult(searchInput: CommandField) {
+  const container = implicitContainerFor(searchInput);
+  if (!container) {
+    return;
+  }
+  clearImplicitResult(searchInput);
+
+  const query = searchInput.value;
+  if (isSlashCommandInput(query)) {
+    return;
+  }
+
+  const detection = detectImplicitCommand(query);
+  if (!detection) {
+    return;
+  }
+
+  const token = ++implicitRenderCounter;
+  implicitRenderToken.set(searchInput, token);
+
+  const stillCurrent = () =>
+    implicitRenderToken.get(searchInput) === token &&
+    activeSearchInput() === searchInput &&
+    searchInput.value === query;
+
+  const mount = (innerHtml: string) => {
+    if (!stillCurrent()) {
+      return;
+    }
+    const block = document.createElement("div");
+    block.className = "implicit-result";
+    block.dataset.commandId = detection.commandId;
+    block.innerHTML = innerHtml;
+    container.replaceChildren(block);
+    if (searchInput === input) {
+      scrollToPrompt();
+    }
+  };
+
+  if (detection.config.implicit.render === "pill") {
+    // Network/side-effecting commands: offer a pill that runs the full command
+    // on click rather than firing a request on every keystroke. We rewrite the
+    // implicit input to the explicit `/command <primary-arg>` form so the normal
+    // slash-command path handles execution + caching.
+    const primaryArg = Object.values(detection.match.args)[0];
+    const explicit = primaryArg === undefined
+      ? detection.command.command
+      : `${detection.command.command} ${String(primaryArg)}`;
+    const label = escapeHtml(detection.match.label ?? detection.command.name);
+    mount(
+      `<button type="button" class="implicit-pill" data-implicit-run="${escapeHtml(explicit)}">` +
+      `<span class="implicit-pill-cmd">${escapeHtml(detection.command.command)}</span>` +
+      `<span class="implicit-pill-label">${label}</span></button>`
+    );
+    return;
+  }
+
+  // inline-live: execute the command client-side. calc/convert are pure +
+  // offline, so executeCommand resolves without a network round-trip.
+  void (async () => {
+    try {
+      const context = createSlashContext({ query });
+      const args = detection.command.parseArguments(context);
+      const output = await detection.command.executeCommand(args, context);
+      const payload = {
+        commandId: detection.commandId,
+        commandName: detection.command.name,
+        command: detection.command.command,
+        query,
+        args,
+        placement: detection.command.placement,
+        schema: detection.command.outputSchema,
+        output,
+        elapsedMs: 0
+      } satisfies SlashCommandResponse;
+      mount(`<div class="implicit-result-body">${renderSlashCommandOutput(payload)}</div>`);
+    } catch {
+      // A half-typed expression that doesn't yet evaluate just shows nothing.
+      if (stillCurrent()) {
+        clearImplicitResult(searchInput);
+      }
+    }
+  })();
+}
+
 function renderSuggestionsForInput(sourceInput: CommandField, suggestionContext: HTMLElement, payload: SuggestResponse) {
   const shortcutOffset = resultShortcutCountFor(sourceInput);
   suggestionContext.innerHTML = payload.suggestions
@@ -2442,7 +2695,8 @@ function bindSuggestionInput(searchInput: CommandField) {
       !keyboardEvent.isComposing &&
       (
         acceptTypedOutputGhost(searchInput) ||
-        acceptSlashCommandGhost(searchInput)
+        acceptSlashCommandGhost(searchInput) ||
+        acceptImplicitGhost(searchInput)
       )
     ) {
       keyboardEvent.preventDefault();
@@ -2470,6 +2724,7 @@ function bindSuggestionInput(searchInput: CommandField) {
     updateSlashCommandControls(searchInput);
     updateCommandHighlight(searchInput);
     scheduleSuggest(searchInput);
+    updateImplicitResult(searchInput);
     clearSuggestionSelection();
   });
   searchInput.addEventListener("focus", () => {
@@ -2642,6 +2897,31 @@ document.addEventListener("click", (event) => {
     return;
   }
   void runSlashCommand(query, results, entryInput, { forceRefresh: true });
+});
+
+// Clicking an implicit pill (e.g. a ticker quote) runs the full command: drop
+// the explicit `/command arg` form into the active input and submit it.
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const pill = target.closest<HTMLElement>(".implicit-pill");
+  if (!pill) {
+    return;
+  }
+  event.preventDefault();
+  const explicit = pill.dataset.implicitRun;
+  const activeInput = activeSearchInput() ?? input;
+  if (!explicit || !activeInput) {
+    return;
+  }
+  activeInput.value = explicit;
+  resizeCommandField(activeInput);
+  updateSlashCommandControls(activeInput);
+  updateCommandHighlight(activeInput);
+  clearImplicitResult(activeInput);
+  activeInput.form?.requestSubmit();
 });
 
 document.addEventListener("click", (event) => {
@@ -4498,22 +4778,56 @@ function appendAiTurn(results: HTMLElement, prompt: string) {
 // can keep the conversation going.
 function appendEmptyTurnInput(entry: HTMLElement) {
   if (entry.dataset.mode !== "ai") {
-    return;
+    return undefined;
   }
   const results = entry.querySelector<HTMLElement>(".results");
   if (!results) {
-    return;
+    return undefined;
   }
   const existing = entry.querySelector<HTMLElement>(".ai-turn:last-child");
   // Reuse a trailing empty turn if one is already there.
   if (existing && !existing.querySelector(".ai-turn-body")?.textContent?.trim()
     && !existing.querySelector<CommandField>(".entry-input")?.value.trim()) {
-    existing.querySelector<CommandField>(".entry-input")?.focus();
-    return;
+    const existingInput = existing.querySelector<CommandField>(".entry-input");
+    if (existingInput) {
+      focusCommandInput(existingInput);
+      scrollSearchInputIntoView(existingInput);
+    }
+    return existingInput;
   }
   const turn = buildTurn();
   results.append(turn);
-  turn.querySelector<CommandField>(".entry-input")?.focus();
+  const turnInput = turn.querySelector<CommandField>(".entry-input");
+  if (turnInput) {
+    focusCommandInput(turnInput);
+    scrollSearchInputIntoView(turnInput);
+  }
+  return turnInput;
+}
+
+function enqueueAiTurn(entry: HTMLElement, turn: HTMLElement, query: string, body: HTMLElement, effort: EffortLevel) {
+  const previous = aiRunQueues.get(entry);
+  if (previous) {
+    body.innerHTML = `<div class="status">Queued</div>`;
+  }
+
+  const run = (previous ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(async () => {
+      if (!entry.isConnected || !turn.isConnected || !body.isConnected) {
+        return;
+      }
+      const thread = aiThreadContext(entry, turn);
+      await runAiPrompt(query, body, effort, thread.turns.length > 0 ? thread : undefined);
+    });
+
+  aiRunQueues.set(entry, run);
+  void run.finally(() => {
+    if (aiRunQueues.get(entry) === run) {
+      aiRunQueues.delete(entry);
+    }
+  });
+  return run;
 }
 
 // Remove every turn after the given one (used when an earlier message is edited
@@ -4556,16 +4870,13 @@ document.addEventListener("submit", async (event) => {
       return;
     }
     const entryEffort = Math.min(Math.max(Number(entry.dataset.effort ?? 3), 1), 5) as EffortLevel;
-    // Context is the turns before this one; later turns are discarded.
-    const thread = aiThreadContext(entry, turn);
     truncateTurnsAfter(turn);
     turn.dataset.prompt = query;
     body.innerHTML = "";
     clearSuggestionsFor(searchInput);
     suggestAbort?.abort();
-    await runAiPrompt(query, body, entryEffort, thread);
     appendEmptyTurnInput(entry);
-    scrollToPrompt();
+    void enqueueAiTurn(entry, turn, query, body, entryEffort);
     return;
   }
 
@@ -4587,9 +4898,12 @@ document.addEventListener("submit", async (event) => {
         resizeCommandField(searchInput);
         updateCommandHighlight(searchInput);
         const body = appendAiTurn(results, query);
-        await runAiPrompt(query, body, entryEffort);
         if (entry) {
           appendEmptyTurnInput(entry);
+          const turn = body.closest<HTMLElement>(".ai-turn");
+          if (turn) {
+            void enqueueAiTurn(entry, turn, query, body, entryEffort);
+          }
         }
       } else {
         await runSearch(query, results, entryEffort);
@@ -4629,8 +4943,12 @@ document.addEventListener("submit", async (event) => {
   clearSuggestionsFor(searchInput);
   suggestAbort?.abort();
   setCommandMode(submittedMode);
-  searchInput.focus();
-  scrollToPrompt();
+  if (submittedMode === "ai") {
+    searchInput.blur();
+  } else {
+    searchInput.focus();
+    scrollToPrompt();
+  }
 
   const results = node.querySelector<HTMLElement>(".results");
   const createdEntry = node.querySelector<HTMLElement>(".entry");
@@ -4648,9 +4966,12 @@ document.addEventListener("submit", async (event) => {
         updateCommandHighlight(createdInput);
       }
       const body = appendAiTurn(results, query);
-      await runAiPrompt(query, body, submittedEffort);
       if (createdEntry) {
         appendEmptyTurnInput(createdEntry);
+        const turn = body.closest<HTMLElement>(".ai-turn");
+        if (turn) {
+          void enqueueAiTurn(createdEntry, turn, query, body, submittedEffort);
+        }
       }
     } else {
       await runSearch(query, results, submittedEffort);
@@ -4659,7 +4980,9 @@ document.addEventListener("submit", async (event) => {
       }
     }
   }
-  scrollToPrompt();
+  if (submittedMode !== "ai") {
+    scrollToPrompt();
+  }
 });
 
 scrollToPrompt();

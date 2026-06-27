@@ -216,7 +216,7 @@ export class OpenMeteoWeatherCommand extends WeatherSlashCommand<WeatherArgs, We
     label: "zipcode",
     type: "text",
     required: true,
-    placeholder: "zipcode",
+    placeholder: "zip",
     widthChars: 5
   }];
   readonly outputSchema = weatherOutputSchema;

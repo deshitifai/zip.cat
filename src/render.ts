@@ -1,6 +1,25 @@
 import type { SearchResponse } from "./models";
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
+const i18n = {
+  en: {
+    languageLabel: "Language"
+  },
+  ca: {
+    languageLabel: "Idioma"
+  }
+};
+
+function renderI18nScript() {
+  return `<script>
+const I18N=${JSON.stringify(i18n)};
+let activeLocale=new URLSearchParams(location.search).get("lang")?.startsWith("ca")?"ca":"en";
+function t(key){return (I18N[activeLocale]&&I18N[activeLocale][key])||I18N.en[key]||key}
+function applyI18n(){document.documentElement.lang=activeLocale;document.querySelector("#language-select").value=activeLocale;document.querySelector("#language-select").setAttribute("aria-label",t("languageLabel"));document.querySelectorAll("[data-i18n]").forEach((node)=>node.textContent=t(node.dataset.i18n))}
+document.addEventListener("change",(event)=>{const target=event.target;if(!(target instanceof HTMLSelectElement)||target.id!=="language-select")return;activeLocale=target.value==="ca"?"ca":"en";const nextUrl=new URL(location.href);nextUrl.searchParams.set("lang",activeLocale);history.replaceState(null,"",nextUrl);applyI18n()});
+applyI18n();
+</script>`;
+}
 
 function renderEffortBars(effort = 3, levels = [1, 2, 3, 4, 5]) {
   const available = new Set(levels);
@@ -125,6 +144,13 @@ ${pageStyles}  </style>
 </head>
 <body>
   <main>
+    <label class="language-switcher">
+      <span data-i18n="languageLabel">Language</span>
+      <select id="language-select" aria-label="Language">
+        <option value="en">English</option>
+        <option value="ca">Català</option>
+      </select>
+    </label>
     <div id="transcript">
       ${renderEntry({
         query: options.query ?? "",
@@ -151,6 +177,7 @@ ${pageStyles}  </style>
     </div>
   </main>
   ${options.staticBuild ? `<script>window.ZIP_CAT_STATIC = true;</script>` : ""}
+  ${renderI18nScript()}
   <script type="module" src="/client.js"></script>
 </body>
 </html>`;
@@ -167,6 +194,25 @@ export const pageStyles = `    * { box-sizing: border-box; }
       width: min(960px, calc(100vw - 32px));
       margin: 0 auto;
       padding: 28px 0 48px;
+    }
+    .language-switcher {
+      align-items: center;
+      border: 1px solid #111;
+      display: inline-flex;
+      gap: 8px;
+      margin: 0 0 10px;
+      padding: 6px 8px;
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .language-switcher select {
+      background: #fff;
+      border: 1px solid #aaa;
+      color: #111;
+      font: inherit;
+      padding: 2px 4px;
+      text-transform: none;
     }
     .query-row {
       display: grid;
@@ -1014,6 +1060,32 @@ export const pageStyles = `    * { box-sizing: border-box; }
       padding: 8px;
       white-space: pre;
     }
+    .implicit-result {
+      margin-top: 6px;
+    }
+    .implicit-result-body .slash-json {
+      font-size: 12px;
+    }
+    .implicit-pill {
+      align-items: baseline;
+      background: #f0f4ff;
+      border: 1px solid #c3d2ff;
+      border-radius: 4px;
+      cursor: pointer;
+      display: inline-flex;
+      font: inherit;
+      font-size: 13px;
+      gap: 6px;
+      padding: 4px 8px;
+    }
+    .implicit-pill:hover {
+      background: #e3ebff;
+    }
+    .implicit-pill-cmd {
+      color: #3355cc;
+      font-size: 11px;
+      font-weight: 600;
+    }
     .weather-card {
       display: grid;
       gap: 10px;
@@ -1095,11 +1167,43 @@ export const pageStyles = `    * { box-sizing: border-box; }
       margin: 0;
       padding: 0;
     }
+    .lanes-open-list {
+      display: grid;
+      gap: 8px;
+    }
+    .lanes-open-day {
+      display: grid;
+      grid-template-columns: minmax(96px, auto) 1fr;
+      gap: 12px;
+    }
+    .lanes-open-date {
+      color: #111;
+    }
+    .lanes-open-times {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+    }
+    .lanes-open-time {
+      color: #111;
+      white-space: nowrap;
+    }
+    .lanes-open-time span {
+      color: #777;
+      font-size: 12px;
+      padding-left: 3px;
+    }
+    .lanes-none {
+      color: #777;
+    }
     .lanes-row {
       display: grid;
       grid-template-columns: minmax(96px, auto) minmax(120px, auto) auto 1fr;
       gap: 12px;
       margin: 0;
+    }
+    .lanes-row-compact {
+      grid-template-columns: minmax(120px, auto) auto 1fr;
     }
     .lanes-day {
       color: #111;
