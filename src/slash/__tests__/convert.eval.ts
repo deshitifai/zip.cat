@@ -255,6 +255,37 @@ export const convertTokenSuite: Suite = {
   }
 };
 
+export const convertExplicitArgsSuite: Suite = {
+  name: "/convert explicit args (client splitter mis-grouping)",
+  run(report) {
+    // The client's generic inline-arg splitter can leak a connective into an
+    // arg (to="to mi"). parseArguments must recover via phrase parsing.
+    const ctx = (query: string, args: Record<string, unknown>) => ({
+      request: { query, command: "/convert", args },
+      startedAt: 0
+    });
+    const cases: Array<{ query: string; args: Record<string, unknown>; from: string; to: string; value: number }> = [
+      { query: "/convert 10 km to mi", args: { value: "10", from: "km", to: "to mi" }, value: 10, from: "km", to: "mi" },
+      { query: "/convert 1 cup in qt", args: { value: "1", from: "cup", to: "in qt" }, value: 1, from: "cup", to: "qt" },
+      { query: "/convert 5 kg to lb", args: { value: "5", from: "kg", to: "to lb" }, value: 5, from: "kg", to: "lb" },
+      // Clean explicit args should still pass straight through.
+      { query: "/convert 10 km mi", args: { value: "10", from: "km", to: "mi" }, value: 10, from: "km", to: "mi" }
+    ];
+    for (const c of cases) {
+      try {
+        const parsed = convert.parseArguments(ctx(c.query, c.args));
+        if (parsed.value !== c.value || parsed.from !== c.from || parsed.to !== c.to) {
+          report.fail(`parseArguments("${c.query}")`, { got: parsed, expected: c });
+        } else {
+          report.ok(`${c.query} → ${c.value} ${c.from}→${c.to}`);
+        }
+      } catch (error) {
+        report.fail(`parseArguments("${c.query}") threw`, String(error));
+      }
+    }
+  }
+};
+
 export const convertImplicitSuite: Suite = {
   name: "/convert implicit match",
   run(report) {
@@ -288,5 +319,6 @@ export const convertSuites: Suite[] = [
   convertCompleteSuite,
   convertTrailingSpaceSuite,
   convertTokenSuite,
+  convertExplicitArgsSuite,
   convertImplicitSuite
 ];

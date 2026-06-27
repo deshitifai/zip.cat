@@ -1,29 +1,39 @@
 import type { SearchResponse } from "./models";
+import { MESSAGES, DEFAULT_LOCALE, translate, type Locale, type MessageKey } from "./i18n";
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
-const i18n = {
-  en: {
-    languageLabel: "Language"
-  },
-  ca: {
-    languageLabel: "Idioma"
-  }
-};
+
+// SSR renders in the default locale; the client re-applies the URL's ?lang= on
+// load (and on switch) via the inline script + the shared i18n catalog.
+function t(key: MessageKey, params?: Record<string, string | number>) {
+  return translate(DEFAULT_LOCALE, key, params);
+}
 
 function renderI18nScript() {
   return `<script>
-const I18N=${JSON.stringify(i18n)};
-let activeLocale=new URLSearchParams(location.search).get("lang")?.startsWith("ca")?"ca":"en";
-function t(key){return (I18N[activeLocale]&&I18N[activeLocale][key])||I18N.en[key]||key}
-function applyI18n(){document.documentElement.lang=activeLocale;document.querySelector("#language-select").value=activeLocale;document.querySelector("#language-select").setAttribute("aria-label",t("languageLabel"));document.querySelectorAll("[data-i18n]").forEach((node)=>node.textContent=t(node.dataset.i18n))}
-document.addEventListener("change",(event)=>{const target=event.target;if(!(target instanceof HTMLSelectElement)||target.id!=="language-select")return;activeLocale=target.value==="ca"?"ca":"en";const nextUrl=new URL(location.href);nextUrl.searchParams.set("lang",activeLocale);history.replaceState(null,"",nextUrl);applyI18n()});
+const I18N=${JSON.stringify(MESSAGES)};
+const LOCALES=${JSON.stringify(Object.keys(MESSAGES) as Locale[])};
+const DEFAULT_LOCALE=${JSON.stringify(DEFAULT_LOCALE)};
+let activeLocale=(()=>{const l=new URLSearchParams(location.search).get("lang");return l&&LOCALES.includes(l)?l:DEFAULT_LOCALE;})();
+function t(key,params){let s=(I18N[activeLocale]&&I18N[activeLocale][key])||I18N[DEFAULT_LOCALE][key]||key;if(params)for(const k in params)s=s.replace(new RegExp("\\\\{"+k+"\\\\}","g"),String(params[k]));return s;}
+window.__zipI18n={get locale(){return activeLocale;},t:t};
+function applyI18n(){
+  document.documentElement.lang=activeLocale;
+  const select=document.querySelector("#lang-select");if(select)select.value=activeLocale;
+  document.querySelectorAll("[data-i18n]").forEach((node)=>{node.textContent=t(node.dataset.i18n);});
+  document.querySelectorAll("[data-i18n-title]").forEach((node)=>{node.setAttribute("title",t(node.dataset.i18nTitle));});
+  document.querySelectorAll("[data-i18n-aria]").forEach((node)=>{node.setAttribute("aria-label",t(node.dataset.i18nAria));});
+  document.dispatchEvent(new CustomEvent("zip:i18n",{detail:{locale:activeLocale}}));
+}
+function setLocale(locale){if(!LOCALES.includes(locale)||locale===activeLocale)return;activeLocale=locale;const nextUrl=new URL(location.href);nextUrl.searchParams.set("lang",activeLocale);history.replaceState(null,"",nextUrl);applyI18n();}
+document.addEventListener("change",(event)=>{const target=event.target;if(!(target instanceof HTMLSelectElement)||target.id!=="lang-select")return;setLocale(target.value);});
 applyI18n();
 </script>`;
 }
 
 function renderEffortBars(effort = 3, levels = [1, 2, 3, 4, 5]) {
   const available = new Set(levels);
-  const label = levels.length === 1 ? "DuckDuckGo Instant Answer" : `Effort ${effort} of 5`;
+  const label = levels.length === 1 ? t("effortDdgInstant") : t("effortAriaLevel", { level: effort });
   return `<span class="effort-bars" data-effort="${effort}" aria-label="${label}" title="${label}">${[1, 2, 3, 4, 5]
     .map((level) => {
       const isAvailable = available.has(level);
@@ -33,8 +43,8 @@ function renderEffortBars(effort = 3, levels = [1, 2, 3, 4, 5]) {
         isAvailable ? "" : "unavailable"
       ].filter(Boolean).join(" ");
       const title = isAvailable
-        ? levels.length === 1 ? label : `Effort ${level} of 5`
-        : `Level ${level} is not configured`;
+        ? levels.length === 1 ? label : t("effortLevelPrefix", { level })
+        : t("effortLevelUnconfigured", { level });
       return `<span class="${classes}" data-effort-level="${level}" title="${title}" aria-hidden="true"></span>`;
     })
     .join("")}</span>`;
@@ -109,12 +119,12 @@ function renderEntry(options: {
       <span class="status-label" aria-hidden="true">$0</span>
       ${renderEffortBars(effort, levels)}
       <form class="entry-form" action="/" method="get" autocomplete="off">
-        <span class="prompt" aria-hidden="true">&gt;</span>
+        <span class="prompt prompt-toggle" aria-hidden="true" title="${t("switchMode")}" data-i18n-title="switchMode">&gt;</span>
         <span class="input-shell">
-          <textarea class="entry-input" aria-label="Previous search" name="q" rows="1">${query}</textarea>
+          <textarea class="entry-input" aria-label="${t("previousSearch")}" data-i18n-aria="previousSearch" name="q" rows="1">${query}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
-        <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+        <button class="voice-button" type="button" aria-label="${t("voiceInput")}" data-i18n-aria="voiceInput" title="${t("voiceInputTitle")}" data-i18n-title="voiceInputTitle">●</button>
         <div class="slash-args" hidden></div>
       </form>
       <div class="results">
@@ -143,14 +153,13 @@ export function renderPage(options: {
 ${pageStyles}  </style>
 </head>
 <body>
+  <header class="site-header">
+    <select id="lang-select" class="lang-select" aria-label="${t("languageLabel")}" data-i18n-aria="languageLabel">
+      <option value="en" lang="en">EN</option>
+      <option value="ca" lang="ca">CA</option>
+    </select>
+  </header>
   <main>
-    <label class="language-switcher">
-      <span data-i18n="languageLabel">Language</span>
-      <select id="language-select" aria-label="Language">
-        <option value="en">English</option>
-        <option value="ca">Català</option>
-      </select>
-    </label>
     <div id="transcript">
       ${renderEntry({
         query: options.query ?? "",
@@ -164,12 +173,12 @@ ${pageStyles}  </style>
         <span class="status-label" aria-hidden="true">$0</span>
         ${renderEffortBars(options.staticBuild ? 1 : 3, options.staticBuild ? [1] : [1, 2, 3, 4, 5])}
         <form id="terminal-form" action="/" method="get" autocomplete="off">
-          <span class="prompt" aria-hidden="true">&gt;</span>
+          <span class="prompt prompt-toggle" aria-hidden="true" title="${t("switchMode")}" data-i18n-title="switchMode">&gt;</span>
           <span class="input-shell">
-            <textarea autofocus aria-label="Search" name="q" rows="1"></textarea>
+            <textarea autofocus aria-label="${t("searchAria")}" data-i18n-aria="searchAria" name="q" rows="1"></textarea>
             <span class="inline-inference-highlight" aria-hidden="true"></span>
           </span>
-          <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+          <button class="voice-button" type="button" aria-label="${t("voiceInput")}" data-i18n-aria="voiceInput" title="${t("voiceInputTitle")}" data-i18n-title="voiceInputTitle">●</button>
           <div class="slash-args" hidden></div>
         </form>
       </section>
@@ -193,26 +202,41 @@ export const pageStyles = `    * { box-sizing: border-box; }
     main {
       width: min(960px, calc(100vw - 32px));
       margin: 0 auto;
-      padding: 28px 0 48px;
+      /* Top padding clears the fixed header so content starts below it. */
+      padding: calc(36px + 28px) 0 48px;
     }
-    .language-switcher {
+    .site-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      width: 100%;
+      background: #fff;
+      border-bottom: 1px solid #111;
+      display: flex;
+      justify-content: flex-end;
       align-items: center;
-      border: 1px solid #111;
-      display: inline-flex;
-      gap: 8px;
-      margin: 0 0 10px;
-      padding: 6px 8px;
-      font-size: 13px;
+      padding: 6px 16px;
+    }
+    .lang-select {
+      background: #fff;
+      border: 1px solid #ccc;
+      color: #111;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
       font-weight: 700;
+      letter-spacing: 0.06em;
+      padding: 3px 6px;
       text-transform: uppercase;
     }
-    .language-switcher select {
-      background: #fff;
-      border: 1px solid #aaa;
-      color: #111;
-      font: inherit;
-      padding: 2px 4px;
-      text-transform: none;
+    .lang-select:hover {
+      border-color: #111;
+    }
+    .lang-select:focus-visible {
+      outline: 2px solid #111;
+      outline-offset: 1px;
     }
     .query-row {
       display: grid;
@@ -507,6 +531,16 @@ export const pageStyles = `    * { box-sizing: border-box; }
       font-weight: 400;
       line-height: 24px;
       transform: none;
+    }
+    .prompt-toggle {
+      cursor: pointer;
+      user-select: none;
+      border-radius: 3px;
+      transition: background 0.1s, color 0.1s;
+    }
+    .prompt-toggle:hover {
+      background: #111;
+      color: #fff;
     }
     input,
     textarea {

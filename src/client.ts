@@ -11,8 +11,60 @@ import {
 import { createSlashContext } from "./slash/base";
 import { typedOutputDescriptors } from "./typedOutputs";
 import { type CacheHit, formatAge, readCache, writeCache } from "./cache";
+import { DEFAULT_LOCALE, isLocale, translate, type Locale, type MessageKey } from "./i18n";
 
 declare const __ZIP_CAT_STATIC_BUILD__: boolean | undefined;
+
+// Active UI locale, derived from ?lang= and kept in sync with the header
+// dropdown via the `zip:i18n` event the inline render script dispatches. Every
+// client-generated label goes through `t()` so it follows the selected language.
+let currentLocale: Locale = (() => {
+  try {
+    const lang = new URLSearchParams(location.search).get("lang");
+    return isLocale(lang) ? lang : DEFAULT_LOCALE;
+  } catch {
+    return DEFAULT_LOCALE;
+  }
+})();
+
+function t(key: MessageKey, params?: Record<string, string | number>) {
+  return translate(currentLocale, key, params);
+}
+
+function localizedRunState(state: "idle" | "active" | "done" | "error") {
+  switch (state) {
+    case "active": return t("statusActive");
+    case "done": return t("statusDone");
+    case "error": return t("statusError");
+    default: return t("statusIdle");
+  }
+}
+
+// Re-localize labels that were built dynamically (so they carry no data-i18n
+// attribute the inline applyI18n could re-run). Static markup is handled by the
+// attribute-driven applyI18n; this covers effort bars and run-status marks.
+function relocalizeDynamicLabels() {
+  try {
+    refreshEffortTitles();
+    document.querySelectorAll<HTMLElement>(".run-status-mark[data-status-kind]").forEach((mark) => {
+      // Only the idle marks have a stable label; busy marks update on next tick.
+      if (!mark.classList.contains("active") && !mark.classList.contains("done") && !mark.classList.contains("error")) {
+        const kind = mark.dataset.statusKind === "ai" ? t("aiLabel") : t("searchLabel");
+        mark.setAttribute("aria-label", `${kind} ${t("statusIdle")}`);
+      }
+    });
+  } catch {
+    // Defensive: a relocalize must never break the page.
+  }
+}
+
+document.addEventListener("zip:i18n", (event) => {
+  const detail = (event as CustomEvent<{ locale?: string }>).detail;
+  if (detail && isLocale(detail.locale)) {
+    currentLocale = detail.locale;
+    relocalizeDynamicLabels();
+  }
+});
 
 type SearchResult = {
   title?: string;
@@ -90,6 +142,48 @@ type VoiceTranscriptionResponse = {
 };
 
 type CommandMode = "search" | "ai";
+
+// The prompt glyph at the start of the command line is a real, ordered registry
+// of modes. Clicking the glyph (or arrow-cycling) advances to the next entry,
+// wrapping around. Adding a future mode is just another array element — every
+// glyph lookup, aria label, and cycle step flows from here, so no per-mode
+// branching is hardcoded elsewhere.
+interface PromptMode {
+  mode: CommandMode;
+  // The character shown as the prompt (">" for search, "*" for AI, ...).
+  glyph: string;
+  // i18n key for the live (main) input's aria-label in this mode.
+  ariaKey: MessageKey;
+  // i18n key for a previous-search/cloned input's aria-label in this mode.
+  previousAriaKey: MessageKey;
+}
+
+const PROMPT_MODES: PromptMode[] = [
+  { mode: "search", glyph: ">", ariaKey: "searchAria", previousAriaKey: "previousSearch" },
+  { mode: "ai", glyph: "*", ariaKey: "aiPrompt", previousAriaKey: "aiPrompt" }
+];
+
+function promptModeFor(mode: CommandMode): PromptMode {
+  return PROMPT_MODES.find((entry) => entry.mode === mode) ?? PROMPT_MODES[0]!;
+}
+
+function promptGlyphFor(mode: CommandMode): string {
+  return promptModeFor(mode).glyph;
+}
+
+// The next mode in the registry, wrapping back to the first after the last.
+function nextCommandMode(mode: CommandMode): CommandMode {
+  const index = PROMPT_MODES.findIndex((entry) => entry.mode === mode);
+  const next = PROMPT_MODES[(index + 1) % PROMPT_MODES.length]!;
+  return next.mode;
+}
+
+// Read the mode off an element's data-mode, defaulting to the first registry
+// entry for any unknown/missing value.
+function modeFromDataset(value: string | undefined): CommandMode {
+  return PROMPT_MODES.find((entry) => entry.mode === value)?.mode ?? PROMPT_MODES[0]!.mode;
+}
+
 type CommandField = HTMLInputElement | HTMLTextAreaElement;
 type EffortLevel = 1 | 2 | 3 | 4 | 5;
 type VoiceEngine = "server" | "browser";
@@ -434,7 +528,7 @@ function updateCommandHighlight(searchInput: CommandField, inlineActive = false)
   const hasValidWindowRef = commandWindowReferences(searchInput.value)
     .some((reference) => Boolean(commandBlockForIndex(reference.index)));
   const hasInlineGlow = inlineActive && inlineInferenceSpans(searchInput.value).length > 0;
-  const mode: CommandMode = block.dataset.mode === "ai" ? "ai" : "search";
+  const mode: CommandMode = modeFromDataset(block.dataset.mode);
   const typedGhostText = typedOutputGhostText(searchInput.value);
   const ghostText = typedGhostText
     || (mode === "search" ? slashCommandGhostText(searchInput.value) : "")
@@ -464,7 +558,7 @@ function effortBarsMarkup(effort: EffortLevel, mode: CommandMode = "search") {
         isAvailable && level <= configuredEffort ? "active" : "",
         isAvailable ? "" : "unavailable"
       ].filter(Boolean).join(" ");
-      const title = isAvailable ? effortDescription(mode, level) : `Level ${level} is not configured`;
+      const title = isAvailable ? effortDescription(mode, level) : t("effortLevelUnconfigured", { level });
       return `<span class="${classes}" data-effort-level="${level}" title="${escapeHtml(title)}" aria-hidden="true"></span>`;
     })
     .join("")}</span>`;
@@ -472,8 +566,8 @@ function effortBarsMarkup(effort: EffortLevel, mode: CommandMode = "search") {
 
 function runStatusMarkup() {
   return `<span class="run-status" aria-live="polite">
-    <span class="run-status-mark" data-status-kind="ai" aria-label="AI idle">*</span>
-    <span class="run-status-mark" data-status-kind="search" aria-label="Search idle">&gt;</span>
+    <span class="run-status-mark" data-status-kind="ai" aria-label="${escapeHtml(t("aiIdle"))}">*</span>
+    <span class="run-status-mark" data-status-kind="search" aria-label="${escapeHtml(t("searchIdle"))}">&gt;</span>
   </span>`;
 }
 
@@ -493,7 +587,7 @@ function turnMarkup(prompt = "") {
         <textarea class="entry-input thread-followup-input" aria-label="Message" name="q" rows="1">${escapeHtml(prompt)}</textarea>
         <span class="inline-inference-highlight" aria-hidden="true"></span>
       </span>
-      <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+      <button class="voice-button" type="button" aria-label="${escapeHtml(t("voiceInput"))}" data-i18n-aria="voiceInput" title="${escapeHtml(t("voiceInputTitle"))}" data-i18n-title="voiceInputTitle">●</button>
       <div class="slash-args" hidden></div>
     </form>
     <div class="ai-turn-body"></div>
@@ -553,7 +647,7 @@ function renderEntry(
   effort: EffortLevel = 3,
   slashArgValues: Record<string, unknown> = {}
 ) {
-  const prompt = mode === "ai" ? "*" : "&gt;";
+  const prompt = escapeHtml(promptGlyphFor(mode));
   const slashCommand = slashCommandForQuery(query);
   const slashValues = Object.keys(slashArgValues).length > 0
     ? slashArgValues
@@ -566,12 +660,12 @@ function renderEntry(
       ${runStatusMarkup()}
       ${effortBarsMarkup(effort, mode)}
       <form class="entry-form" action="/" method="get" autocomplete="off">
-        <span class="prompt" aria-hidden="true">${prompt}</span>
+        <span class="prompt prompt-toggle" aria-hidden="true" title="${escapeHtml(t("switchMode"))}" data-i18n-title="switchMode">${prompt}</span>
         <span class="input-shell">
-          <textarea class="entry-input" aria-label="Previous search" name="q" rows="1">${escapeHtml(displayQuery)}</textarea>
+          <textarea class="entry-input" aria-label="${escapeHtml(t("previousSearch"))}" data-i18n-aria="previousSearch" name="q" rows="1">${escapeHtml(displayQuery)}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
-        <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+        <button class="voice-button" type="button" aria-label="${escapeHtml(t("voiceInput"))}" data-i18n-aria="voiceInput" title="${escapeHtml(t("voiceInputTitle"))}" data-i18n-title="voiceInputTitle">●</button>
         ${slashCommandControlsMarkup(slashCommand, slashValues)}
       </form>
       <div class="results">${content}</div>
@@ -944,27 +1038,30 @@ function adjacentConfiguredEffortLevel(effort: EffortLevel, mode: CommandMode, d
 function effortAriaLabel(mode: CommandMode, effort: EffortLevel, levels = configuredEffortLevels(mode)) {
   const configuredEffort = closestConfiguredEffortLevel(effort, mode);
   if (levels.length === 1) {
-    return `${mode === "ai" ? "AI" : "Search"} generator ${configuredEffort}`;
+    return t("effortAriaGenerator", { mode: mode === "ai" ? t("aiLabel") : t("searchLabel"), level: configuredEffort });
   }
-  return `Effort ${configuredEffort} of 5`;
+  return t("effortAriaLevel", { level: configuredEffort });
 }
 
 function effortDescription(mode: CommandMode, effort: EffortLevel) {
+  // The "Effort N of 5" prefix is localized; generator names/api/pricing come
+  // from config and stay as-is (they're proper nouns / provider details).
+  const prefix = t("effortLevelPrefix", { level: effort });
   if (mode === "ai") {
     if (aiEngine === "browser-gemma") {
-      return "Local Gemma 4 WebGPU; runs 100% in this browser; downloads the model on first selection and caches it in site storage; $0 API cost";
+      return t("localGemmaDescription");
     }
 
     const generator = effortConfig?.ai.levels[String(effort)];
     return generator
-      ? `Effort ${effort} of 5: ${generator.name}; ${generator.api} via ${generator.provider}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
-      : `Effort ${effort} of 5: AI model level ${effort}`;
+      ? `${prefix}: ${generator.name}; ${generator.api} via ${generator.provider}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
+      : `${prefix}: ${t("aiLabel")} ${effort}`;
   }
 
   const generator = effortConfig?.search.levels[String(effort)];
   return generator
-    ? `Effort ${effort} of 5: ${generator.name}; ${generator.api}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
-    : `Effort ${effort} of 5: Exa search effort level ${effort}`;
+    ? `${prefix}: ${generator.name}; ${generator.api}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
+    : `${prefix}: ${t("searchLabel")} ${effort}`;
 }
 
 function menuPricing(pricing: string | undefined) {
@@ -1141,7 +1238,7 @@ async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel)
   if (results.length === 0) {
     results.push({
       url: `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
-      title: `Search DuckDuckGo for ${query}`,
+      title: t("searchDuckDuckGo", { query }),
       provider: "duckduckgo"
     });
   }
@@ -1189,7 +1286,7 @@ function updateEffortBars(bars: HTMLElement, effort: EffortLevel, mode: CommandM
         isAvailable && level <= configuredEffort ? "active" : "",
         isAvailable ? "" : "unavailable"
       ].filter(Boolean).join(" ");
-      const title = isAvailable ? effortDescription(mode, level) : `Level ${level} is not configured`;
+      const title = isAvailable ? effortDescription(mode, level) : t("effortLevelUnconfigured", { level });
       return `<span class="${classes}" data-effort-level="${level}" title="${escapeHtml(title)}" aria-hidden="true"></span>`;
     })
     .join("");
@@ -1220,7 +1317,7 @@ function activeEffortContext() {
   if (entry) {
     const bars = entry.querySelector<HTMLElement>(".effort-bars");
     const effort = normalizeEffortLevel(Number(entry.dataset.effort ?? bars?.dataset.effort ?? 3));
-    const mode: CommandMode = entry.dataset.mode === "ai" ? "ai" : "search";
+    const mode: CommandMode = modeFromDataset(entry.dataset.mode);
     return { bars, entry, effort, mode };
   }
 
@@ -1239,7 +1336,7 @@ function effortContextForBars(bars: HTMLElement): EffortContext {
       bars,
       entry,
       effort: normalizeEffortLevel(Number(entry.dataset.effort ?? bars.dataset.effort ?? 3)),
-      mode: entry.dataset.mode === "ai" ? "ai" : "search"
+      mode: modeFromDataset(entry.dataset.mode)
     };
   }
 
@@ -1347,10 +1444,10 @@ function setCommandMode(mode: CommandMode) {
     updateEffortBars(bars, effortLevel, commandMode);
   }
   if (commandPrompt) {
-    commandPrompt.textContent = mode === "ai" ? "*" : ">";
+    commandPrompt.textContent = promptGlyphFor(mode);
   }
   if (input) {
-    input.setAttribute("aria-label", mode === "ai" ? "AI prompt" : "Search");
+    input.setAttribute("aria-label", t(promptModeFor(mode).ariaKey));
     scheduleSuggest(input);
   }
 }
@@ -1361,9 +1458,9 @@ function setInputCommandMode(searchInput: CommandField, mode: CommandMode) {
     entry.dataset.mode = mode;
     const prompt = entry.querySelector<HTMLElement>(".prompt");
     if (prompt) {
-      prompt.textContent = mode === "ai" ? "*" : ">";
+      prompt.textContent = promptGlyphFor(mode);
     }
-    searchInput.setAttribute("aria-label", mode === "ai" ? "AI prompt" : "Previous search");
+    searchInput.setAttribute("aria-label", t(promptModeFor(mode).previousAriaKey));
     const bars = entry.querySelector<HTMLElement>(".effort-bars");
     if (bars) {
       updateEffortBars(bars, normalizeEffortLevel(Number(entry.dataset.effort ?? 3)), mode);
@@ -1526,8 +1623,8 @@ function setRunStatus(
   if (state === "active") {
     entry?.classList.add(`run-active-${kind}`);
   }
-  const statusLabel = label ?? (kind === "ai" ? "AI" : "Search");
-  mark.setAttribute("aria-label", `${statusLabel} ${state}`);
+  const statusLabel = label ?? (kind === "ai" ? t("aiLabel") : t("searchLabel"));
+  mark.setAttribute("aria-label", `${statusLabel} ${localizedRunState(state)}`);
   if (state === "idle") {
     mark.removeAttribute("title");
     return;
@@ -1551,7 +1648,7 @@ function resetRunStatus(results: HTMLElement) {
   marks?.forEach((mark) => {
     mark.classList.remove("used", "active", "done", "error");
     mark.removeAttribute("title");
-    mark.setAttribute("aria-label", `${mark.dataset.statusKind === "ai" ? "AI" : "Search"} idle`);
+    mark.setAttribute("aria-label", `${mark.dataset.statusKind === "ai" ? t("aiLabel") : t("searchLabel")} ${t("statusIdle")}`);
   });
 }
 
@@ -1819,10 +1916,8 @@ function toggleCommandMode() {
   }
 
   const entry = sourceInput.closest<HTMLElement>(".entry");
-  const currentMode: CommandMode = entry
-    ? entry.dataset.mode === "ai" ? "ai" : "search"
-    : commandMode;
-  setInputCommandMode(sourceInput, currentMode === "search" ? "ai" : "search");
+  const currentMode: CommandMode = entry ? modeFromDataset(entry.dataset.mode) : commandMode;
+  setInputCommandMode(sourceInput, nextCommandMode(currentMode));
 }
 
 function isEffortModifier(event: KeyboardEvent) {
@@ -2349,7 +2444,7 @@ function commandBlockSnapshot(index: number) {
   }
 
   const query = block.querySelector<CommandField>('textarea[name="q"], input[name="q"]')?.value.trim() ?? "";
-  const mode: CommandMode = block.dataset.mode === "ai" ? "ai" : "search";
+  const mode: CommandMode = modeFromDataset(block.dataset.mode);
   const debugData = debugResultData(block);
   const searchResults = Array.from(block.querySelectorAll<HTMLTableRowElement>(".results table tbody tr"))
     .map((row, resultIndex) => {
@@ -2922,6 +3017,33 @@ document.addEventListener("click", (event) => {
   updateCommandHighlight(activeInput);
   clearImplicitResult(activeInput);
   activeInput.form?.requestSubmit();
+});
+
+// Clicking the prompt glyph (> / * / ...) cycles through the registered prompt
+// modes, wrapping around. AI-thread follow-up prompts are locked to AI, so they
+// don't cycle.
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const prompt = target.closest<HTMLElement>(".prompt");
+  if (!prompt) {
+    return;
+  }
+  const form = prompt.closest<HTMLElement>("form");
+  if (!form || form.classList.contains("thread-followup")) {
+    return;
+  }
+  const field = form.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+  if (!field) {
+    return;
+  }
+  event.preventDefault();
+  const entry = field.closest<HTMLElement>(".entry");
+  const currentMode: CommandMode = entry ? modeFromDataset(entry.dataset.mode) : commandMode;
+  setInputCommandMode(field, nextCommandMode(currentMode));
+  field.focus();
 });
 
 document.addEventListener("click", (event) => {
@@ -3542,10 +3664,11 @@ function cacheChipMarkup(hit: { storedAt: number; ttlMs: number } | undefined) {
   const ageMs = Math.max(Date.now() - hit.storedAt, 0);
   const stale = ageMs >= hit.ttlMs;
   const label = formatAge(ageMs);
-  const title = `Updated ${label === "now" ? "just now" : `${label} ago`}${stale ? " · stale" : ""}. Click refresh to update.`;
+  const updated = label === "now" ? t("cacheUpdatedNow") : t("cacheUpdatedAgo", { age: label });
+  const title = `${updated}${stale ? t("cacheStaleSuffix") : ""}. ${t("cacheClickRefresh")}`;
   return `<div class="cache-chip${stale ? " cache-chip-stale" : ""}" data-stored-at="${hit.storedAt}" data-ttl="${hit.ttlMs}">
     <span class="cache-age" title="${escapeHtml(title)}">${escapeHtml(label)}</span>
-    <button type="button" class="cache-refresh" aria-label="Refresh" title="Refresh now">↻</button>
+    <button type="button" class="cache-refresh" aria-label="${escapeHtml(t("refresh"))}" title="${escapeHtml(t("refreshNow"))}">↻</button>
   </div>`;
 }
 

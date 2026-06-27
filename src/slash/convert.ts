@@ -702,8 +702,15 @@ export class ConvertCommand extends LookupSlashCommand<ConvertArgs, ConvertOutpu
 
     if (explicitValue !== undefined && explicitFrom && explicitTo) {
       const value = Number(explicitValue);
-      if (!Number.isNaN(value)) {
-        return { value, from: String(explicitFrom).trim(), to: String(explicitTo).trim() };
+      const from = String(explicitFrom).trim();
+      const to = String(explicitTo).trim();
+      // The generic inline-arg splitter can mis-group a connective into an arg
+      // (e.g. "/convert 10 km to mi" → to="to mi"). If an arg still carries a
+      // connective or extra whitespace, fall through to phrase parsing below.
+      const clean = (unit: string) =>
+        !/\s/.test(unit) && !CONNECTIVES.has(unit.toLowerCase());
+      if (!Number.isNaN(value) && clean(from) && clean(to)) {
+        return { value, from, to };
       }
     }
 
