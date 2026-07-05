@@ -40,7 +40,14 @@ Server mode reads env from `.env`, `~/cats/.env`, and
 EXA_API_KEY=...
 SERP_API_KEY=...
 OPENROUTER_API_KEY=...
+SEARXNG_URL=...   # optional: base URL of a SearXNG instance (keyless web search)
 ```
+
+`SEARXNG_URL` points at a self-hosted [SearXNG](https://github.com/searxng/searxng)
+instance (e.g. `http://localhost:8888`). With no `EXA_API_KEY`, every search
+effort level routes to the instance instead; with both set, Exa wins and
+SearXNG is the fallback. The instance must allow JSON output — include `json`
+under `search.formats` in its `settings.yml`.
 
 Optional local/server voice:
 

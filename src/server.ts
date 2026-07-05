@@ -5,7 +5,7 @@ import { renderPage } from "./render";
 import { renderDocsPage } from "./docs";
 import { search } from "./search";
 import { suggest } from "./suggest";
-import { createWebSearchGenerators } from "./generators/webSearch";
+import { webSearchEffortLevels } from "./generators/webSearch";
 import { createPluginRegistry } from "./plugins/registry";
 import { runSlashCommand, slashCommandDescriptors } from "./slash/registry";
 import { typedOutputDescriptors, typedOutputRefs } from "./typedOutputs";
@@ -197,10 +197,7 @@ const app = new Elysia()
     search: {
       provider: "web-search",
       api: "Web search",
-      levels: Object.fromEntries(createWebSearchGenerators().map((generator) => [
-        generator.effort,
-        generator.describe()
-      ]))
+      levels: webSearchEffortLevels()
     },
     ai: aiEffortConfig()
   }))

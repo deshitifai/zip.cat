@@ -9,6 +9,7 @@
     "dev:server": "bun --watch src/server.ts",
     "eval:suggest": "bun src/plugins/__tests__/suggest.eval.ts",
     "eval:format": "bun src/__tests__/resultFormat.eval.ts",
+    "eval:searxng": "bun src/generators/__tests__/searxng.eval.ts",
     "eval:inline": "bun scripts/eval_inline_substitutions.ts",
     "eval:inline:openrouter": "bun scripts/eval_inline_substitutions.ts --models openrouter:openai/gpt-4.1-mini",
     "eval:inline:local": "bun scripts/eval_inline_substitutions.ts --models local-gemma-node",
