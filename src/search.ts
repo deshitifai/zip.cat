@@ -36,7 +36,7 @@ export async function search(registry: PluginRegistry, request: SearchRequest): 
 
   const enabledPlugins = registry.search.filter((plugin) => plugin.enabled());
   if (enabledPlugins.length === 0) {
-    throw new Error("No search plugin enabled. Set EXA_API_KEY or SERP_API_KEY.");
+    throw new Error("No search plugin enabled. Set EXA_API_KEY, SERP_API_KEY, or SEARXNG_URL.");
   }
 
   const qualifiedPlugins = [];

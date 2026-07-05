@@ -2,7 +2,7 @@ import { aiEffortConfig, answer, resolveInlineInference, shapeSearchResults } fr
 import { configureRuntimeEnv, type RuntimeEnv } from "../../src/runtimeEnv";
 import { search } from "../../src/search";
 import { suggest } from "../../src/suggest";
-import { createWebSearchGenerators } from "../../src/generators/webSearch";
+import { webSearchEffortLevels } from "../../src/generators/webSearch";
 import { createPluginRegistry } from "../../src/plugins/registry";
 import { runSlashCommand, slashCommandDescriptors } from "../../src/slash/registry";
 import { typedOutputDescriptors } from "../../src/typedOutputs";
@@ -84,10 +84,7 @@ export const onRequest = async ({ request, env }: PagesContext) => {
         search: {
           provider: "web-search",
           api: "Web search",
-          levels: Object.fromEntries(createWebSearchGenerators().map((generator) => [
-            generator.effort,
-            generator.describe()
-          ]))
+          levels: webSearchEffortLevels()
         },
         ai: aiEffortConfig()
       });
