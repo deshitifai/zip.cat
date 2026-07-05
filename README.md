@@ -28,7 +28,8 @@ Build:
 bun run build
 ```
 
-Static output is written to `dist/static`.
+Cloudflare Pages output is written to `dist/static`, with server-backed `/api/*`
+routes supplied by Pages Functions.
 
 ## Keys
 
@@ -47,7 +48,8 @@ Optional local/server voice:
 pip install moonshine-voice
 ```
 
-Static mode includes no secrets.
+Static mode includes no secrets. Production Cloudflare Pages keeps `EXA_API_KEY`
+and `OPENROUTER_API_KEY` in Pages secrets, not in the browser bundle.
 
 ## Search
 
@@ -63,7 +65,7 @@ Search effort:
 | 2 | Exa Fast |
 | 3 | Exa Auto |
 | 4 | Exa Deep Lite |
-| 5 | SerpAPI Google Search |
+| 5 | Exa Deep |
 
 Search supports:
 

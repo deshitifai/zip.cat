@@ -1,5 +1,6 @@
 import Exa from "exa-js";
 import type { EffortLevel, SearchResult } from "../models";
+import { envVar } from "../runtimeEnv";
 import { WebSearchGenerator, type GeneratorDescriptor, type WebSearchRequest } from "./base";
 
 type ExaSearchType = "instant" | "fast" | "auto" | "deep-lite" | "deep";
@@ -24,7 +25,7 @@ export abstract class ExaWebSearchGenerator extends GenericWebSearchGenerator {
   protected abstract readonly numResults: number;
 
   enabled() {
-    return Boolean(process.env.EXA_API_KEY);
+    return Boolean(envVar("EXA_API_KEY"));
   }
 
   describe(): GeneratorDescriptor {
@@ -42,7 +43,7 @@ export abstract class ExaWebSearchGenerator extends GenericWebSearchGenerator {
   }
 
   async execute(request: WebSearchRequest): Promise<SearchResult[]> {
-    const apiKey = process.env.EXA_API_KEY;
+    const apiKey = envVar("EXA_API_KEY");
     if (!apiKey) {
       throw new Error("EXA_API_KEY is not set.");
     }

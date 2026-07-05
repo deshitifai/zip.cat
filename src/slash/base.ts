@@ -145,6 +145,14 @@ export abstract class LanesSlashCommand<TArgs extends Record<string, unknown>, T
   } as const;
 }
 
+export abstract class StockSlashCommand<TArgs extends Record<string, unknown>, TOutput>
+  extends LookupSlashCommand<TArgs, TOutput> {
+  readonly placement: SlashCommandPlacement = {
+    target: "results",
+    renderer: "stock-card"
+  } as const;
+}
+
 export function createSlashContext(request: SlashCommandRequest): SlashCommandContext {
   return {
     request: {

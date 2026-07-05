@@ -10,6 +10,14 @@ import {
 } from "./slash/registry";
 import { createSlashContext } from "./slash/base";
 import { typedOutputDescriptors } from "./typedOutputs";
+import {
+  defaultResultFormat,
+  type ResultFormatKind,
+  resultFormatForQuery,
+  resultFormatForTypedOutput,
+  resultFormatIconMarkup,
+  resultFormatIndicatorMarkup
+} from "./resultFormat";
 import { type CacheHit, formatAge, readCache, writeCache } from "./cache";
 import { DEFAULT_LOCALE, isLocale, translate, type Locale, type MessageKey } from "./i18n";
 
@@ -42,10 +50,11 @@ function localizedRunState(state: "idle" | "active" | "done" | "error") {
 
 // Re-localize labels that were built dynamically (so they carry no data-i18n
 // attribute the inline applyI18n could re-run). Static markup is handled by the
-// attribute-driven applyI18n; this covers effort bars and run-status marks.
+// attribute-driven applyI18n; this covers effort bars, voice hints, and run-status marks.
 function relocalizeDynamicLabels() {
   try {
     refreshEffortTitles();
+    refreshVoiceButtonLabels();
     document.querySelectorAll<HTMLElement>(".run-status-mark[data-status-kind]").forEach((mark) => {
       // Only the idle marks have a stable label; busy marks update on next tick.
       if (!mark.classList.contains("active") && !mark.classList.contains("done") && !mark.classList.contains("error")) {
@@ -194,6 +203,11 @@ type EffortContext = {
   effort: EffortLevel;
   mode: CommandMode;
 };
+type FormatMenuContext = {
+  field: CommandField;
+  form: HTMLElement;
+  mode: CommandMode;
+};
 type AiThreadTurn = {
   window: string;
   prompt: string;
@@ -252,7 +266,7 @@ type SlashCommandDescriptor = {
   arguments: SlashCommandArgument[];
   placement: {
     target: "results";
-    renderer: "weather-card" | "lanes-card" | "json";
+    renderer: "weather-card" | "lanes-card" | "stock-card" | "json";
   };
   outputSchema: Record<string, unknown>;
   cache?: { ttlMs: number };
@@ -265,7 +279,7 @@ type SlashCommandResponse = {
   args: Record<string, unknown>;
   placement: {
     target: "results";
-    renderer: "weather-card" | "lanes-card" | "json";
+    renderer: "weather-card" | "lanes-card" | "stock-card" | "json";
   };
   schema: Record<string, unknown>;
   output: unknown;
@@ -273,7 +287,7 @@ type SlashCommandResponse = {
   debug?: Record<string, unknown>;
   error?: string;
 };
-type TypedOutputRenderer = "markdown" | "boolean" | "restaurant-card" | "restaurant-list" | "json";
+type TypedOutputRenderer = "markdown" | "boolean" | "url" | "restaurant-card" | "restaurant-list" | "json";
 type TypedOutputDescriptor = {
   id: string;
   marker: `#${string}`;
@@ -309,9 +323,13 @@ type CommandSelection = {
   end: number;
   direction: "forward" | "backward" | "none";
 };
+type LuckySubmit = {
+  target: Window | null;
+};
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
 const allEffortLevels = [1, 2, 3, 4, 5] as EffortLevel[];
+const mobileSearchResultLimit = 6;
 const staticBuild = typeof __ZIP_CAT_STATIC_BUILD__ !== "undefined" && __ZIP_CAT_STATIC_BUILD__;
 const staticMode = staticBuild ||
   document.documentElement.dataset.zipStatic === "true" ||
@@ -360,6 +378,9 @@ let browserMoonshineStatus: "idle" | "loading" | "ready" | "error" = "idle";
 let browserMoonshineStatusMessage = "";
 let browserMoonshineActiveHandler: ((payload: BrowserMoonshineMessage) => void) | undefined;
 let threadIdCounter = 0;
+let lastVoiceInput: CommandField | undefined;
+let pendingVoiceStart: Promise<void> | undefined;
+const luckySubmits = new WeakMap<HTMLFormElement, LuckySubmit>();
 
 function escapeHtml(value: string) {
   return value
@@ -441,6 +462,21 @@ function typedOutputForMarker(marker: string) {
   return typedOutputs.find((descriptor) => descriptor.marker.toLowerCase() === normalized.toLowerCase());
 }
 
+function urlTypedOutputDescriptor() {
+  return typedOutputForMarker("#url") ?? {
+    id: "url",
+    marker: "#url" as const,
+    name: "url",
+    label: "URL",
+    description: "A single best destination URL.",
+    renderer: "url" as const,
+    schema: {
+      type: "string",
+      format: "uri"
+    }
+  };
+}
+
 function typedOutputReferences(query: string) {
   const refs: Array<{ descriptor: TypedOutputDescriptor; marker: string; start: number; end: number }> = [];
   for (const match of query.matchAll(/#([A-Za-z][A-Za-z0-9_]*)(\s*\[\])?/g)) {
@@ -463,6 +499,59 @@ function stripTypedOutputMarkers(query: string) {
   return query.replace(/#([A-Za-z][A-Za-z0-9_]*)(\s*\[\])?/g, (value) => (
     typedOutputForMarker(value) ? "" : value
   )).replace(/\s{2,}/g, " ").trim();
+}
+
+function typedOutputFormatAppendix(descriptor: TypedOutputDescriptor) {
+  if (descriptor.renderer === "url") {
+    return `Output format requested by the user:
+First solve the user's request exactly as you would if no output format had been requested. The format must not change the destination you choose. Then encode only the best destination URL as a single JSON string.
+
+URL rules:
+- Return the canonical page that best satisfies the user's request.
+- Prefer a direct article, product, venue, documentation, profile, or official page over a search-results page or homepage.
+- The URL must be absolute and use http:// or https://.
+- Do not return tracking redirects, JavaScript URLs, mailto links, or relative URLs.
+
+Output rules:
+- Return exactly one JSON string and nothing else.
+- Correct example: "https://example.com/path"
+- Incorrect examples: {"url":"https://example.com/path"}, https://example.com/path, [https://example.com/path](https://example.com/path)
+- Do not include markdown, prose, code fences, comments, or explanation.`;
+  }
+
+  return `Output format requested by the user:
+First solve the user's request exactly as you would if no output format had been requested. The format must not change the answer you choose. Then encode only that final answer as JSON matching ${descriptor.marker}.
+
+Output rules:
+- Return exactly one JSON value and nothing else.
+- Do not include markdown, prose, code fences, comments, or explanation outside the JSON value.
+- The JSON value must validate against the requested type.`;
+}
+
+function typedOutputInstruction(descriptor: TypedOutputDescriptor, prompt: string) {
+  return `${prompt}
+
+${typedOutputFormatAppendix(descriptor)}`;
+}
+
+function typedOutputMessages(descriptor: TypedOutputDescriptor, messages: AiChatMessage[]) {
+  const nextMessages = messages.map((message) => ({ ...message }));
+  for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
+    if (nextMessages[index].role === "user") {
+      nextMessages[index].content = typedOutputInstruction(
+        descriptor,
+        stripTypedOutputMarkers(nextMessages[index].content)
+      );
+      return nextMessages;
+    }
+  }
+  return [
+    ...nextMessages,
+    {
+      role: "user" as const,
+      content: typedOutputFormatAppendix(descriptor)
+    }
+  ];
 }
 
 function typedOutputGhostMatch(query: string) {
@@ -520,8 +609,9 @@ function commandHighlightHtml(query: string, inlineActive = false, ghostText = "
 
 function updateCommandHighlight(searchInput: CommandField, inlineActive = false) {
   const block = searchInput.closest<HTMLElement>(".entry, .current-command");
-  const highlight = block?.querySelector<HTMLElement>(".inline-inference-highlight");
-  if (!block || !highlight) {
+  const inputShell = searchInput.closest<HTMLElement>(".input-shell");
+  const highlight = inputShell?.querySelector<HTMLElement>(".inline-inference-highlight");
+  if (!block || !inputShell || !highlight) {
     return;
   }
 
@@ -529,6 +619,7 @@ function updateCommandHighlight(searchInput: CommandField, inlineActive = false)
     .some((reference) => Boolean(commandBlockForIndex(reference.index)));
   const hasInlineGlow = inlineActive && inlineInferenceSpans(searchInput.value).length > 0;
   const mode: CommandMode = modeFromDataset(block.dataset.mode);
+  updateResultFormatIndicator(searchInput, mode);
   const typedGhostText = typedOutputGhostText(searchInput.value);
   const ghostText = typedGhostText
     || (mode === "search" ? slashCommandGhostText(searchInput.value) : "")
@@ -536,12 +627,30 @@ function updateCommandHighlight(searchInput: CommandField, inlineActive = false)
   const hasTypedOutputRef = typedOutputReferences(searchInput.value).length > 0;
   if (!hasValidWindowRef && !hasInlineGlow && !ghostText && !hasTypedOutputRef) {
     block.classList.remove("command-highlight-active");
+    inputShell.classList.remove("command-highlight-active");
     highlight.replaceChildren();
     return;
   }
 
   highlight.innerHTML = commandHighlightHtml(searchInput.value, inlineActive, ghostText);
-  block.classList.add("command-highlight-active");
+  block.classList.remove("command-highlight-active");
+  inputShell.classList.add("command-highlight-active");
+}
+
+function updateResultFormatIndicator(searchInput: CommandField, mode: CommandMode = "search") {
+  const indicator = searchInput
+    .closest<HTMLFormElement>("form")
+    ?.querySelector<HTMLElement>(".format-indicator");
+  if (!indicator) {
+    return;
+  }
+
+  const wrapper = document.createElement("span");
+  wrapper.innerHTML = resultFormatIndicatorMarkup(resultFormatForQuery(searchInput.value, mode, typedOutputs));
+  const nextIndicator = wrapper.firstElementChild;
+  if (nextIndicator) {
+    indicator.replaceWith(nextIndicator);
+  }
 }
 
 function effortBarsMarkup(effort: EffortLevel, mode: CommandMode = "search") {
@@ -560,6 +669,15 @@ function effortBarsMarkup(effort: EffortLevel, mode: CommandMode = "search") {
       ].filter(Boolean).join(" ");
       const title = isAvailable ? effortDescription(mode, level) : t("effortLevelUnconfigured", { level });
       return `<span class="${classes}" data-effort-level="${level}" title="${escapeHtml(title)}" aria-hidden="true"></span>`;
+    })
+    .join("")}</span>`;
+}
+
+function effortMenuBarsMarkup(mode: CommandMode, effort: EffortLevel) {
+  return `<span class="effort-menu-bars" aria-label="${escapeHtml(effortAriaLabel(mode, effort))}">${allEffortLevels
+    .map((level) => {
+      const classes = ["effort-bar", level <= effort ? "active" : ""].filter(Boolean).join(" ");
+      return `<span class="${classes}" aria-hidden="true"></span>`;
     })
     .join("")}</span>`;
 }
@@ -587,7 +705,7 @@ function turnMarkup(prompt = "") {
         <textarea class="entry-input thread-followup-input" aria-label="Message" name="q" rows="1">${escapeHtml(prompt)}</textarea>
         <span class="inline-inference-highlight" aria-hidden="true"></span>
       </span>
-      <button class="voice-button" type="button" aria-label="${escapeHtml(t("voiceInput"))}" data-i18n-aria="voiceInput" title="${escapeHtml(t("voiceInputTitle"))}" data-i18n-title="voiceInputTitle">●</button>
+      ${resultFormatIndicatorMarkup(resultFormatForQuery(prompt, "ai", typedOutputs))}
       <div class="slash-args" hidden></div>
     </form>
     <div class="ai-turn-body"></div>
@@ -665,7 +783,7 @@ function renderEntry(
           <textarea class="entry-input" aria-label="${escapeHtml(t("previousSearch"))}" data-i18n-aria="previousSearch" name="q" rows="1">${escapeHtml(displayQuery)}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
-        <button class="voice-button" type="button" aria-label="${escapeHtml(t("voiceInput"))}" data-i18n-aria="voiceInput" title="${escapeHtml(t("voiceInputTitle"))}" data-i18n-title="voiceInputTitle">●</button>
+        ${resultFormatIndicatorMarkup(resultFormatForQuery(displayQuery, mode, typedOutputs))}
         ${slashCommandControlsMarkup(slashCommand, slashValues)}
       </form>
       <div class="results">${content}</div>
@@ -679,6 +797,23 @@ function scrollToPrompt() {
   requestAnimationFrame(() => {
     window.scrollTo({
       top: document.documentElement.scrollHeight,
+      behavior: "smooth"
+    });
+  });
+}
+
+function isMobileViewport() {
+  return window.matchMedia("(max-width: 720px)").matches;
+}
+
+function defaultSearchResultLimit() {
+  return isMobileViewport() ? mobileSearchResultLimit : undefined;
+}
+
+function scrollToSubmittedEntry(row: Element) {
+  requestAnimationFrame(() => {
+    row.scrollIntoView({
+      block: "start",
       behavior: "smooth"
     });
   });
@@ -709,6 +844,7 @@ let slashCommands: SlashCommandDescriptor[] = [];
 let typedOutputs: TypedOutputDescriptor[] = [];
 let activeWindowReferenceTarget: HTMLElement | undefined;
 let effortMenuContext: EffortContext | undefined;
+let formatMenuContext: FormatMenuContext | undefined;
 let suggestSuppressedUntil = 0;
 const debugPayloads = new WeakMap<HTMLElement, DebugPayload>();
 const aiRunQueues = new WeakMap<HTMLElement, Promise<void>>();
@@ -1202,7 +1338,7 @@ type DuckDuckGoInstantAnswer = {
   RelatedTopics?: unknown[];
 };
 
-async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel): Promise<SearchResponse> {
+async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel, limit?: number): Promise<SearchResponse> {
   const startedAt = performance.now();
   // DuckDuckGo Instant Answer is no-key JSON/JSONP for answers and related topics, not a full organic SERP API.
   const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
@@ -1233,7 +1369,7 @@ async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel)
       seen.add(result.url);
       return true;
     })
-    .slice(0, Math.max(3, effort * 3));
+    .slice(0, limit ?? Math.max(3, effort * 3));
 
   if (results.length === 0) {
     results.push({
@@ -1412,7 +1548,7 @@ function openEffortMenu(context: EffortContext) {
     .map((level) => {
       const active = level === activeEffort && (context.mode !== "ai" || aiEngine === "openrouter") ? " active" : "";
       return `<button class="effort-menu-option${active}" type="button" role="menuitem" data-effort-level="${level}">
-        <span class="effort-menu-level">Level ${level}</span>
+        ${effortMenuBarsMarkup(context.mode, level)}
         <span class="effort-menu-detail">${escapeHtml(effortMenuDescription(context.mode, level))}</span>
       </button>`;
     })
@@ -1434,6 +1570,161 @@ function openEffortMenu(context: EffortContext) {
   menu.style.top = `${Math.max(8, top)}px`;
 }
 
+function closeFormatMenu() {
+  document.querySelector<HTMLElement>(".format-menu")?.remove();
+  formatMenuContext = undefined;
+}
+
+function commandModeForField(field: CommandField): CommandMode {
+  if (field.closest("form")?.classList.contains("thread-followup")) {
+    return "ai";
+  }
+  const block = field.closest<HTMLElement>(".entry, .current-command");
+  return block ? modeFromDataset(block.dataset.mode) : commandMode;
+}
+
+function visibleFormatMenuOptions(menu: HTMLElement) {
+  return Array.from(menu.querySelectorAll<HTMLElement>(".format-menu-option:not([hidden])"));
+}
+
+function setActiveFormatMenuOption(menu: HTMLElement, option: HTMLElement | undefined) {
+  menu.querySelectorAll(".format-menu-option.active").forEach((other) => other.classList.remove("active"));
+  option?.classList.add("active");
+  option?.scrollIntoView({ block: "nearest" });
+}
+
+function filterFormatMenu(menu: HTMLElement, query: string) {
+  const needle = query.trim().toLowerCase();
+  menu.querySelectorAll<HTMLElement>(".format-menu-option").forEach((option) => {
+    option.hidden = Boolean(needle) && !(option.dataset.filterText ?? "").includes(needle);
+  });
+  const visible = visibleFormatMenuOptions(menu);
+  if (!visible.some((option) => option.classList.contains("active"))) {
+    setActiveFormatMenuOption(menu, visible[0]);
+  }
+}
+
+// Selecting a result type edits the query itself: the typed-output marker in
+// the text (e.g. #Restaurant[]) stays the single source of truth for the
+// requested schema, so swapping types rewrites or appends that marker.
+function applyTypedOutputSelection(field: CommandField, mode: CommandMode, descriptor?: TypedOutputDescriptor) {
+  const refs = typedOutputReferences(field.value);
+  if (!descriptor) {
+    field.value = stripTypedOutputMarkers(field.value);
+  } else if (refs.length > 0) {
+    let value = field.value;
+    for (let index = refs.length - 1; index >= 1; index -= 1) {
+      value = `${value.slice(0, refs[index]!.start)}${value.slice(refs[index]!.end)}`;
+    }
+    const first = refs[0]!;
+    field.value = `${value.slice(0, first.start)}${descriptor.marker}${value.slice(first.end)}`.replace(/\s{2,}/g, " ");
+  } else {
+    const base = field.value.replace(/\s+$/, "");
+    field.value = base ? `${base} ${descriptor.marker}` : descriptor.marker;
+  }
+  resizeCommandField(field);
+  updateCommandHighlight(field);
+  updateResultFormatIndicator(field, mode);
+  field.focus();
+  field.setSelectionRange(field.value.length, field.value.length);
+}
+
+function selectFormatMenuOption(option: HTMLElement) {
+  const context = formatMenuContext;
+  closeFormatMenu();
+  if (!context) {
+    return;
+  }
+  const choice = option.dataset.formatChoice;
+  const descriptor = choice && choice !== "default"
+    ? typedOutputs.find((entry) => entry.id === choice)
+    : undefined;
+  applyTypedOutputSelection(context.field, context.mode, descriptor);
+}
+
+function formatMenuOptionMarkup(choice: string, kind: ResultFormatKind, name: string, detail: string, active: boolean) {
+  const filterText = `${name} ${detail}`.toLowerCase();
+  return `<button class="format-menu-option${active ? " active" : ""}" type="button" role="option" data-format-choice="${escapeHtml(choice)}" data-filter-text="${escapeHtml(filterText)}">
+    <span class="format-menu-icon">${resultFormatIconMarkup(kind)}</span>
+    <span class="format-menu-name">${escapeHtml(name)}</span>
+    <span class="format-menu-detail">${escapeHtml(detail)}</span>
+  </button>`;
+}
+
+function openFormatMenu(indicator: HTMLElement) {
+  closeEffortMenu();
+  closeFormatMenu();
+  const form = indicator.closest<HTMLElement>("form");
+  const field = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+  if (!form || !field) {
+    return;
+  }
+  const mode = commandModeForField(field);
+  formatMenuContext = { field, form, mode };
+
+  const activeId = typedOutputReferences(field.value)[0]?.descriptor.id;
+  const fallback = defaultResultFormat(mode);
+  const menu = document.createElement("div");
+  menu.className = "format-menu";
+  menu.setAttribute("role", "listbox");
+  menu.setAttribute("aria-label", "Select result type");
+  const passwordManagerIgnoreAttrs = ` autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other"`;
+  menu.innerHTML = `<input class="format-menu-search" type="text" placeholder="Search result types" aria-label="Search result types"${passwordManagerIgnoreAttrs}>
+    <div class="format-menu-options">
+      ${formatMenuOptionMarkup("default", fallback.kind, fallback.label, "Default; free-form result", !activeId)}
+      ${typedOutputs.map((descriptor) => formatMenuOptionMarkup(
+        descriptor.id,
+        resultFormatForTypedOutput(descriptor).kind,
+        descriptor.name,
+        descriptor.description,
+        descriptor.id === activeId
+      )).join("")}
+    </div>`;
+  document.body.append(menu);
+
+  const rect = indicator.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const left = Math.min(Math.max(8, rect.right - menuRect.width), window.innerWidth - menuRect.width - 8);
+  const top = Math.min(rect.bottom + 8, window.innerHeight - menuRect.height - 8);
+  menu.style.left = `${Math.max(8, left)}px`;
+  menu.style.top = `${Math.max(8, top)}px`;
+
+  const search = menu.querySelector<HTMLInputElement>(".format-menu-search");
+  search?.addEventListener("input", () => filterFormatMenu(menu, search.value));
+  search?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      const contextField = formatMenuContext?.field;
+      closeFormatMenu();
+      contextField?.focus();
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const visible = visibleFormatMenuOptions(menu);
+      if (visible.length === 0) {
+        return;
+      }
+      const index = visible.findIndex((option) => option.classList.contains("active"));
+      const next = event.key === "ArrowDown"
+        ? visible[Math.min(index + 1, visible.length - 1)]
+        : visible[Math.max(index - 1, 0)];
+      setActiveFormatMenuOption(menu, next);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const visible = visibleFormatMenuOptions(menu);
+      const choice = visible.find((option) => option.classList.contains("active")) ?? visible[0];
+      if (choice) {
+        selectFormatMenuOption(choice);
+      }
+    }
+  });
+  search?.focus();
+}
+
 function setCommandMode(mode: CommandMode) {
   commandMode = mode;
   if (currentCommand) {
@@ -1448,6 +1739,7 @@ function setCommandMode(mode: CommandMode) {
   }
   if (input) {
     input.setAttribute("aria-label", t(promptModeFor(mode).ariaKey));
+    updateResultFormatIndicator(input, mode);
     scheduleSuggest(input);
   }
 }
@@ -1465,6 +1757,7 @@ function setInputCommandMode(searchInput: CommandField, mode: CommandMode) {
     if (bars) {
       updateEffortBars(bars, normalizeEffortLevel(Number(entry.dataset.effort ?? 3)), mode);
     }
+    updateResultFormatIndicator(searchInput, mode);
     scheduleSuggest(searchInput);
     return;
   }
@@ -1508,6 +1801,7 @@ function selectionForCommandInput(searchInput: CommandField, preserveCurrentSele
 }
 
 function focusCommandInput(searchInput: CommandField, selection = selectionForCommandInput(searchInput)) {
+  lastVoiceInput = searchInput;
   searchInput.focus({ preventScroll: true });
   searchInput.setSelectionRange(selection.start, selection.end, selection.direction);
 }
@@ -1521,6 +1815,84 @@ function isEnterKeyEvent(event: KeyboardEvent) {
     event.which === 13;
 }
 
+function isLuckyEnterEvent(event: KeyboardEvent) {
+  return isEnterKeyEvent(event) &&
+    (event.metaKey || event.ctrlKey) &&
+    !event.altKey &&
+    !event.shiftKey &&
+    !event.isComposing;
+}
+
+function openLuckyTarget() {
+  const target = window.open("about:blank", "_blank");
+  try {
+    if (target?.document) {
+      target.document.title = "zip.cat";
+      target.document.body.innerHTML = `<main style="font:16px system-ui,sans-serif;margin:2rem;color:#111">Opening...</main>`;
+    }
+    target?.focus();
+  } catch {
+    // Cross-window access can fail in hardened browser contexts.
+  }
+  return target;
+}
+
+function normalizeHttpUrl(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function navigateLuckyTarget(lucky: LuckySubmit | undefined, url: string) {
+  const normalized = normalizeHttpUrl(url);
+  if (!normalized) {
+    failLuckyTarget(lucky, "No valid URL was returned.");
+    return false;
+  }
+
+  if (lucky?.target && !lucky.target.closed) {
+    try {
+      lucky.target.opener = null;
+    } catch {
+      // Best effort only; navigation below is the important part.
+    }
+    lucky.target.location.href = normalized;
+    try {
+      lucky.target.focus();
+    } catch {
+      // Focus can be blocked by browser settings.
+    }
+    return true;
+  }
+
+  window.open(normalized, "_blank", "noopener,noreferrer")?.focus();
+  return true;
+}
+
+function failLuckyTarget(lucky: LuckySubmit | undefined, message: string) {
+  if (!lucky?.target || lucky.target.closed) {
+    return;
+  }
+
+  try {
+    lucky.target.document.title = "zip.cat";
+    lucky.target.document.body.innerHTML = `<main style="font:16px system-ui,sans-serif;margin:2rem;color:#111">${escapeHtml(message)}</main>`;
+  } catch {
+    try {
+      lucky.target.close();
+    } catch {
+      // Nothing else to do.
+    }
+  }
+}
 
 function shortcutFromCode(code: string) {
   if (/^Digit[1-9]$/.test(code)) {
@@ -2070,6 +2442,54 @@ function renderAiText(text: string) {
   return `<div class="ai-response">${decorateWindowReferences(sanitizeMarkdownHtml(html))}</div>`;
 }
 
+function parseTypedOutputJson(text: string, descriptor: TypedOutputDescriptor) {
+  const trimmed = text.trim();
+  const unwrapped = trimmed.startsWith("```")
+    ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
+    : trimmed;
+  const jsonText = unwrapped.match(/(?:\{[\s\S]*\}|\[[\s\S]*\]|true|false|null|"[^"]*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/)?.[0] ?? unwrapped;
+  const parsed = JSON.parse(jsonText) as unknown;
+
+  if (descriptor.renderer === "url") {
+    if (typeof parsed === "string") {
+      const url = normalizeHttpUrl(parsed);
+      if (url) {
+        return url;
+      }
+    }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      for (const key of ["url", "href", "link"]) {
+        if (typeof record[key] === "string") {
+          const url = normalizeHttpUrl(record[key]);
+          if (url) {
+            return url;
+          }
+        }
+      }
+    }
+    throw new Error("Typed URL output did not contain an absolute http(s) URL.");
+  }
+
+  return parsed;
+}
+
+function typedOutputResultFromText(text: string, descriptor: TypedOutputDescriptor): TypedOutputResult {
+  return {
+    descriptor,
+    value: parseTypedOutputJson(text, descriptor),
+    rawText: text
+  };
+}
+
+function urlFromTypedOutput(output: TypedOutputResult | undefined) {
+  if (!output || output.descriptor.renderer !== "url") {
+    return undefined;
+  }
+
+  return typeof output.value === "string" ? normalizeHttpUrl(output.value) : undefined;
+}
+
 function stringValue(record: Record<string, unknown>, key: string) {
   const value = record[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -2135,6 +2555,14 @@ function renderTypedOutput(output: TypedOutputResult | undefined, fallbackText: 
   if (output.descriptor.renderer === "boolean") {
     if (typeof output.value === "boolean") {
       return `<div class="ai-response typed-response typed-bool">${output.value ? "True" : "False"}</div>`;
+    }
+    return `<div class="ai-response typed-response"><pre class="typed-json">${escapeHtml(JSON.stringify(output.value, null, 2))}</pre></div>`;
+  }
+
+  if (output.descriptor.renderer === "url") {
+    const url = typeof output.value === "string" ? normalizeHttpUrl(output.value) : undefined;
+    if (url) {
+      return `<div class="ai-response typed-response"><p><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a></p></div>`;
     }
     return `<div class="ai-response typed-response"><pre class="typed-json">${escapeHtml(JSON.stringify(output.value, null, 2))}</pre></div>`;
   }
@@ -2240,6 +2668,113 @@ function renderWeatherCard(output: unknown) {
       }).join("")}
     </div>
     <div class="weather-source">${escapeHtml(weather.source?.name ?? "Open-Meteo")}</div>
+  </section>`;
+}
+
+function formatStockPrice(value: unknown, currency: string | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "--";
+  }
+
+  const currencyCode = /^[A-Z]{3}$/.test(currency ?? "") ? currency! : "USD";
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: currencyCode,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: value >= 10 ? 2 : 4
+    }).format(value);
+  } catch {
+    return `${value.toFixed(value >= 10 ? 2 : 4)} ${currency ?? ""}`.trim();
+  }
+}
+
+function stockSparkline(points: Array<{ date?: string; close?: number }>, previousClose: unknown, price: unknown) {
+  const numericPoints = points
+    .filter((point): point is { date?: string; close: number } => (
+      typeof point.close === "number" && Number.isFinite(point.close)
+    ));
+
+  if (numericPoints.length < 2) {
+    if (typeof previousClose === "number" && typeof price === "number" && Number.isFinite(previousClose) && Number.isFinite(price)) {
+      numericPoints.splice(0, numericPoints.length, { close: previousClose }, { close: price });
+    }
+  }
+
+  if (numericPoints.length < 2) {
+    return `<div class="stock-sparkline stock-sparkline-empty" aria-label="No chart data"></div>`;
+  }
+
+  const width = 164;
+  const height = 42;
+  const padding = 3;
+  const values = numericPoints.map((point) => point.close);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const spread = max - min || 1;
+  const chartWidth = width - padding * 2;
+  const chartHeight = height - padding * 2;
+  const svgPoints = numericPoints.map((point, index) => {
+    const x = padding + (index / (numericPoints.length - 1)) * chartWidth;
+    const y = padding + ((max - point.close) / spread) * chartHeight;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const first = numericPoints[0]?.close;
+  const last = numericPoints[numericPoints.length - 1]?.close;
+  const direction = last >= first ? "up" : "down";
+
+  return `<svg class="stock-sparkline stock-sparkline-${direction}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Stock price trend">
+    <polyline points="${svgPoints}" vector-effect="non-scaling-stroke"></polyline>
+  </svg>`;
+}
+
+function renderStockCard(output: unknown) {
+  if (!output || typeof output !== "object") {
+    return `<div class="status">No stock output.</div>`;
+  }
+
+  const stock = output as {
+    symbol?: string;
+    price?: number;
+    currency?: string;
+    change?: number;
+    changePercent?: number;
+    previousClose?: number;
+    asOf?: string;
+    sparkline?: Array<{
+      date?: string;
+      close?: number;
+    }>;
+    source?: {
+      name?: string;
+      url?: string;
+    };
+  };
+  const change = typeof stock.change === "number" && Number.isFinite(stock.change) ? stock.change : 0;
+  const changePercent = typeof stock.changePercent === "number" && Number.isFinite(stock.changePercent) ? stock.changePercent : 0;
+  const direction = change > 0 ? "up" : change < 0 ? "down" : "flat";
+  const sign = change > 0 ? "+" : "";
+  const price = formatStockPrice(stock.price, stock.currency);
+  const changeText = `${sign}${change.toFixed(2)} (${sign}${changePercent.toFixed(2)}%)`;
+  const sourceName = stock.source?.name ?? "Yahoo Finance";
+  const sourceUrl = stock.source?.url;
+  const source = sourceUrl
+    ? `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(sourceName)}</a>`
+    : escapeHtml(sourceName);
+
+  return `<section class="stock-card stock-${direction}">
+    <div class="stock-topline">
+      <div>
+        <div class="stock-symbol">${escapeHtml(stock.symbol ?? "Stock")}</div>
+        <div class="stock-price">${escapeHtml(price)}</div>
+      </div>
+      ${stockSparkline(stock.sparkline ?? [], stock.previousClose, stock.price)}
+    </div>
+    <div class="stock-meta">
+      <span class="stock-change">${escapeHtml(changeText)}</span>
+      ${stock.asOf ? `<span>${escapeHtml(stock.asOf)}</span>` : ""}
+      <span>${source}</span>
+    </div>
   </section>`;
 }
 
@@ -2385,6 +2920,10 @@ function renderSlashCommandOutput(payload: SlashCommandResponse) {
 
   if (payload.placement.renderer === "lanes-card") {
     return renderLanesCard(payload.output);
+  }
+
+  if (payload.placement.renderer === "stock-card") {
+    return renderStockCard(payload.output);
   }
 
   return `<pre class="slash-json">${escapeHtml(JSON.stringify(payload.output, null, 2))}</pre>`;
@@ -2610,9 +3149,6 @@ function updateImplicitResult(searchInput: CommandField) {
     block.dataset.commandId = detection.commandId;
     block.innerHTML = innerHtml;
     container.replaceChildren(block);
-    if (searchInput === input) {
-      scrollToPrompt();
-    }
   };
 
   if (detection.config.implicit.render === "pill") {
@@ -2667,9 +3203,6 @@ function renderSuggestionsForInput(sourceInput: CommandField, suggestionContext:
     .map((suggestion, index) => renderSuggestionPill(suggestion, index + shortcutOffset))
     .join("");
   clearSuggestionSelection();
-  if (sourceInput === input) {
-    scrollToPrompt();
-  }
 }
 
 function rerunEmptyTypedServerEntries() {
@@ -2684,7 +3217,7 @@ function rerunEmptyTypedServerEntries() {
       return;
     }
 
-    const hasRenderedContent = Boolean(results.querySelector("table, .ai-response, .status, .weather-card, .restaurant-card"));
+    const hasRenderedContent = Boolean(results.querySelector("table, .ai-response, .status, .weather-card, .stock-card, .restaurant-card"));
     if (hasRenderedContent || results.textContent?.trim()) {
       return;
     }
@@ -2800,10 +3333,23 @@ function bindSuggestionInput(searchInput: CommandField) {
 
     if (
       !isEnterKeyEvent(keyboardEvent) ||
-      keyboardEvent.ctrlKey ||
-      keyboardEvent.metaKey ||
       keyboardEvent.isComposing
     ) {
+      return;
+    }
+
+    if (isLuckyEnterEvent(keyboardEvent)) {
+      keyboardEvent.preventDefault();
+      if (searchInput.form) {
+        luckySubmits.set(searchInput.form, {
+          target: openLuckyTarget()
+        });
+        searchInput.form.requestSubmit();
+      }
+      return;
+    }
+
+    if (keyboardEvent.ctrlKey || keyboardEvent.metaKey) {
       return;
     }
 
@@ -3066,7 +3612,7 @@ document.addEventListener("dblclick", (event) => {
     return;
   }
 
-  if (target.closest("textarea, input, a, button, .effort-menu, .effort-bars, .window-ref-pill")) {
+  if (target.closest("textarea, input, a, button, .effort-menu, .effort-bars, .window-ref-pill, .format-indicator, .format-menu")) {
     return;
   }
 
@@ -3134,6 +3680,51 @@ document.addEventListener("click", (event) => {
   }
 
   closeEffortMenu();
+});
+
+// The result-format indicator opens a searchable result-type picker; choosing
+// an option rewrites the typed-output marker in the query.
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+
+  const option = target.closest<HTMLElement>(".format-menu-option");
+  if (option && formatMenuContext) {
+    event.preventDefault();
+    selectFormatMenuOption(option);
+    return;
+  }
+
+  if (target.closest(".format-menu")) {
+    return;
+  }
+
+  const indicator = target.closest<HTMLElement>(".format-indicator");
+  if (indicator) {
+    event.preventDefault();
+    if (formatMenuContext && formatMenuContext.form === indicator.closest("form")) {
+      closeFormatMenu();
+      return;
+    }
+    openFormatMenu(indicator);
+    return;
+  }
+
+  closeFormatMenu();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") {
+    return;
+  }
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || !target.classList.contains("format-indicator")) {
+    return;
+  }
+  event.preventDefault();
+  openFormatMenu(target);
 });
 
 if (staticMode) {
@@ -3472,7 +4063,7 @@ async function resolveInlineQuery(query: string, effort: EffortLevel) {
   };
 }
 
-async function runSearch(query: string, results: HTMLElement, effort: EffortLevel) {
+async function runSearch(query: string, results: HTMLElement, effort: EffortLevel, lucky?: LuckySubmit) {
   results.innerHTML = "";
   resetRunStatus(results);
 
@@ -3495,11 +4086,12 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
       resizeCommandField(resolvedInput);
       updateCommandHighlight(resolvedInput);
     }
-    const typedOutput = typedOutputReferences(resolved.resolvedQuery)[0]?.descriptor;
+    const typedOutput = lucky ? undefined : typedOutputReferences(resolved.resolvedQuery)[0]?.descriptor;
     const searchQuery = typedOutput ? stripTypedOutputMarkers(resolved.resolvedQuery) : resolved.resolvedQuery;
     setRunStatus(results, "search", "active");
     const searchRequestBody = {
       query: searchQuery,
+      limit: defaultSearchResultLimit(),
       effort,
       trigger: {
         type: "keyboard",
@@ -3519,9 +4111,9 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
           "content-type": "application/json"
         },
         body: JSON.stringify(searchRequestBody)
-      });
+    });
     const payload = useDuckDuckGoInstant
-      ? await duckDuckGoInstantAnswerSearch(searchQuery, effort) as SearchResponse & { error?: string }
+      ? await duckDuckGoInstantAnswerSearch(searchQuery, effort, searchRequestBody.limit) as SearchResponse & { error?: string }
       : await (response as Response).json() as SearchResponse & { error?: string };
     const searchCallPricing = searchCallPricingDescription(effort, payload.results?.length ?? 0);
     setEntryDebug(results, {
@@ -3544,11 +4136,21 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
 
     if (!response.ok) {
       setRunStatus(results, "search", "error", payload.elapsedMs, "Search", searchCallPricing);
+      failLuckyTarget(lucky, payload.error ?? "Search failed.");
       results.innerHTML = `<div class="status">${escapeHtml(payload.error ?? "Search failed.")}</div>`;
       return;
     }
 
     setRunStatus(results, "search", "done", payload.elapsedMs, "Search", searchCallPricing);
+    if (lucky) {
+      const firstUrl = payload.results?.[0]?.url;
+      if (firstUrl && navigateLuckyTarget(lucky, firstUrl)) {
+        results.innerHTML = `<div class="status">Opening ${escapeHtml(firstUrl)}</div>${renderRows(payload.results ?? [])}`;
+      } else {
+        results.innerHTML = `<div class="status">No search result URL to open.</div>${renderRows(payload.results ?? [])}`;
+      }
+      return;
+    }
     results.innerHTML = renderRows(payload.results ?? []);
     if (typedOutput && staticMode) {
       setRunStatus(results, "ai", "error", undefined, "Typed AI", "$0");
@@ -3635,6 +4237,7 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
     });
     setRunStatus(results, inlineInferenceSpans(query).length > 0 || typedOutputReferences(query).length > 0 ? "ai" : "search", "error");
     setInlineInferenceHighlight(results, query, false);
+    failLuckyTarget(lucky, error instanceof Error ? error.message : "Search failed.");
     results.innerHTML = `<div class="status">${escapeHtml(error instanceof Error ? error.message : "Search failed.")}</div>`;
   }
 }
@@ -4060,7 +4663,8 @@ async function runBrowserGemmaPrompt(
   typedOutput: TypedOutputDescriptor | undefined,
   results: HTMLElement,
   effort: EffortLevel,
-  thread?: AiThreadContext
+  thread?: AiThreadContext,
+  lucky?: LuckySubmit
 ) {
   const requestId = crypto.randomUUID();
   const requestBody = {
@@ -4104,6 +4708,7 @@ async function runBrowserGemmaPrompt(
     const finishWithError = (message: string) => {
       cleanup();
       setRunStatus(results, "ai", "error", undefined, "Gemma", "$0");
+      failLuckyTarget(lucky, message);
       results.innerHTML = `<div class="status">${escapeHtml(message)}</div>`;
       resolve();
     };
@@ -4138,9 +4743,30 @@ async function runBrowserGemmaPrompt(
       if (message.type === "done") {
         cleanup();
         lastText = message.text;
-        results.innerHTML = renderAiText(lastText);
-        assignAiLinkShortcuts(results);
         setRunStatus(results, "ai", "done", message.elapsedMs, "Gemma", "$0");
+        let parsedTypedOutput: TypedOutputResult | undefined;
+        if (typedOutput) {
+          try {
+            parsedTypedOutput = typedOutputResultFromText(lastText, typedOutput);
+          } catch (error) {
+            if (lucky) {
+              failLuckyTarget(lucky, error instanceof Error ? error.message : "AI did not return a URL.");
+            }
+          }
+        }
+        if (lucky) {
+          const url = urlFromTypedOutput(parsedTypedOutput);
+          if (url && navigateLuckyTarget(lucky, url)) {
+            results.innerHTML = renderTypedOutput(parsedTypedOutput, lastText);
+          } else {
+            results.innerHTML = `<div class="status">AI did not return a URL.</div>${renderAiText(lastText)}`;
+          }
+        } else {
+          results.innerHTML = parsedTypedOutput
+            ? renderTypedOutput(parsedTypedOutput, lastText)
+            : renderAiText(lastText);
+        }
+        assignAiLinkShortcuts(results);
         setEntryDebug(results, {
           kind: "ai",
           userPrompt: prompt,
@@ -4189,17 +4815,26 @@ async function runBrowserGemmaPrompt(
   });
 }
 
-async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortLevel, thread?: AiThreadContext) {
+async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortLevel, thread?: AiThreadContext, lucky?: LuckySubmit) {
   results.innerHTML = "";
   resetRunStatus(results);
   setRunStatus(results, "ai", "active");
   const expandedPrompt = expandPromptWithWindowReferences(prompt);
   const messages = threadMessagesForPrompt(expandedPrompt, thread);
   const modelPrompt = promptWithThreadFallback(expandedPrompt, messages);
-  const typedOutput = typedOutputReferences(prompt)[0]?.descriptor;
+  const typedOutput = typedOutputReferences(prompt)[0]?.descriptor ?? (lucky ? urlTypedOutputDescriptor() : undefined);
 
   if (staticMode || aiEngine === "browser-gemma") {
-    await runBrowserGemmaPrompt(prompt, modelPrompt, messages, typedOutput, results, effort, thread);
+    await runBrowserGemmaPrompt(
+      prompt,
+      typedOutput ? typedOutputInstruction(typedOutput, stripTypedOutputMarkers(modelPrompt)) : modelPrompt,
+      typedOutput && messages ? typedOutputMessages(typedOutput, messages) : messages,
+      typedOutput,
+      results,
+      effort,
+      thread,
+      lucky
+    );
     return;
   }
 
@@ -4243,15 +4878,25 @@ async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortL
 
     if (!response.ok) {
       setRunStatus(results, "ai", "error", payload.elapsedMs, "AI", aiCallPricing);
+      failLuckyTarget(lucky, payload.error ?? "AI request failed.");
       results.innerHTML = `<div class="status">${escapeHtml(payload.error ?? "AI request failed.")}</div>`;
       return;
     }
 
     setRunStatus(results, "ai", "done", payload.elapsedMs, "AI", aiCallPricing);
+    if (lucky) {
+      const url = urlFromTypedOutput(payload.typedOutput);
+      if (!url || !navigateLuckyTarget(lucky, url)) {
+        failLuckyTarget(lucky, "AI did not return a URL.");
+        results.innerHTML = `<div class="status">AI did not return a URL.</div>${renderTypedOutput(payload.typedOutput, payload.text)}`;
+        return;
+      }
+    }
     results.innerHTML = renderTypedOutput(payload.typedOutput, payload.text);
     assignAiLinkShortcuts(results);
   } catch (error) {
     setRunStatus(results, "ai", "error");
+    failLuckyTarget(lucky, error instanceof Error ? error.message : "AI request failed.");
     results.innerHTML = `<div class="status">${escapeHtml(error instanceof Error ? error.message : "AI request failed.")}</div>`;
   }
 }
@@ -4310,21 +4955,28 @@ type BrowserMoonshineMessage =
   | { type: "done"; text: string }
   | { type: "error"; error: string };
 
-function setVoiceButtonState(button: HTMLButtonElement, state: "idle" | "loading" | "recording" | "transcribing" | "error") {
+function setVoiceButtonState(button: HTMLButtonElement, state: "idle" | "loading" | "ready" | "recording" | "transcribing" | "error") {
   button.classList.toggle("loading", state === "loading");
+  button.classList.toggle("ready", state === "ready");
   button.classList.toggle("recording", state === "recording");
   button.classList.toggle("transcribing", state === "transcribing");
   button.classList.toggle("error", state === "error");
   button.disabled = state === "transcribing";
-  button.title = state === "recording"
-    ? "Stop voice input"
+  const hint = state === "recording"
+    ? t("voiceInputRecordingHint")
     : state === "loading"
-      ? "Loading browser Moonshine voice model"
+      ? t("voiceInputLoadingHint")
       : state === "transcribing"
-      ? "Transcribing with Moonshine"
-      : state === "error"
-        ? "Voice transcription failed"
-        : `Voice input with ${voiceEngine === "browser" ? "browser Moonshine" : "server Moonshine"}`;
+        ? t("voiceInputTranscribingHint")
+        : state === "error"
+          ? t("voiceInputErrorHint")
+          : t("voiceInputHint");
+  const title = state === "idle" || state === "ready"
+    ? `${t("voiceInputTitle")} (${voiceEngine === "browser" ? t("voiceMenuBrowser") : t("voiceMenuServer")})`
+    : hint;
+  button.title = title;
+  button.dataset.voiceHint = hint;
+  button.setAttribute("aria-label", state === "recording" ? t("voiceInputRecordingHint") : t("voiceInput"));
 }
 
 function refreshBrowserMoonshineButtonState() {
@@ -4337,7 +4989,27 @@ function refreshBrowserMoonshineButtonState() {
     }
     if (browserMoonshineStatus === "loading") {
       setVoiceButtonState(button, "loading");
+    } else if (browserMoonshineStatus === "ready") {
+      setVoiceButtonState(button, "ready");
     } else if (browserMoonshineStatus === "error") {
+      setVoiceButtonState(button, "error");
+    } else {
+      setVoiceButtonState(button, "idle");
+    }
+  });
+}
+
+function refreshVoiceButtonLabels() {
+  document.querySelectorAll<HTMLButtonElement>(".voice-button").forEach((button) => {
+    if (button.classList.contains("recording")) {
+      setVoiceButtonState(button, "recording");
+    } else if (button.classList.contains("transcribing")) {
+      setVoiceButtonState(button, "transcribing");
+    } else if (button.classList.contains("loading")) {
+      setVoiceButtonState(button, "loading");
+    } else if (button.classList.contains("ready")) {
+      setVoiceButtonState(button, "ready");
+    } else if (button.classList.contains("error")) {
       setVoiceButtonState(button, "error");
     } else {
       setVoiceButtonState(button, "idle");
@@ -4596,22 +5268,17 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
   }
 
   const selectedEngine = staticMode ? "browser" : voiceEngine;
-  const socket = selectedEngine === "server" ? new WebSocket(voiceWebSocketUrl()) : undefined;
+  let socket: WebSocket | undefined;
   const worker = selectedEngine === "browser"
     ? getBrowserMoonshineWorker()
     : undefined;
-  if (selectedEngine === "browser" && browserMoonshineStatus === "loading") {
-    setVoiceButtonState(button, "loading");
-  }
-
-  if (socket) {
-    await new Promise<void>((resolve, reject) => {
-      socket.addEventListener("open", () => resolve(), { once: true });
-      socket.addEventListener("error", () => reject(new Error("Voice stream could not connect.")), { once: true });
-    });
-  }
+  setVoiceButtonState(button, "loading");
 
   let recorderState: VoiceRecorderState | undefined;
+  let stream: MediaStream | undefined;
+  let context: AudioContext | undefined;
+  let source: MediaStreamAudioSourceNode | undefined;
+  let captureNode: AudioNode | undefined;
   const handleVoiceMessage = (payload: BrowserMoonshineMessage | { type?: string; status?: string; text?: string; error?: string; detail?: string }) => {
     if (payload.type === "status" && payload.status === "loading") {
       setVoiceButtonState(button, "loading");
@@ -4649,43 +5316,29 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
     }
   };
 
-  socket?.addEventListener("message", (event) => {
-    if (typeof event.data === "string") {
-      handleVoiceMessage(JSON.parse(event.data) as { type?: string; text?: string; error?: string; detail?: string });
-    }
-  });
-  socket?.addEventListener("error", () => {
-    if (recorderState) {
-      setVoiceButtonState(button, "error");
-      window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
-    }
-  });
-  socket?.addEventListener("close", () => {
-    if (recorderState && button.classList.contains("transcribing")) {
-      setVoiceButtonState(button, "idle");
-    }
-  });
   if (selectedEngine === "browser") {
     browserMoonshineActiveHandler = handleVoiceMessage;
   }
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    // Request mic access before any awaited websocket/model setup so the call
+    // still happens inside the user's click activation window.
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true
       }
     });
-    const context = new AudioContextConstructor(selectedEngine === "browser"
+    context = new AudioContextConstructor(selectedEngine === "browser"
       ? {
         sampleRate: 16000,
         latencyHint: "interactive"
       }
       : undefined);
     await context.resume();
-    const source = context.createMediaStreamSource(stream);
+    source = context.createMediaStreamSource(stream);
     const pendingPcm: Int16Array[] = [];
-    const captureNode = await createVoiceCaptureNode(context, (samples) => {
+    captureNode = await createVoiceCaptureNode(context, (samples) => {
       if (recorderState?.engine === "server") {
         pendingPcm.push(pcm16FromFloat32(samples));
       } else {
@@ -4699,6 +5352,25 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
     captureNode.connect(context.destination);
     const insertStart = input.selectionStart ?? input.value.length;
     const insertEnd = input.selectionEnd ?? insertStart;
+    if (selectedEngine === "server") {
+      socket = new WebSocket(voiceWebSocketUrl());
+      socket.addEventListener("message", (event) => {
+        if (typeof event.data === "string") {
+          handleVoiceMessage(JSON.parse(event.data) as { type?: string; text?: string; error?: string; detail?: string });
+        }
+      });
+      socket.addEventListener("error", () => {
+        if (recorderState) {
+          setVoiceButtonState(button, "error");
+          window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
+        }
+      });
+      socket.addEventListener("close", () => {
+        if (recorderState && button.classList.contains("transcribing")) {
+          setVoiceButtonState(button, "idle");
+        }
+      });
+    }
 
     recorderState = {
       engine: selectedEngine,
@@ -4723,11 +5395,18 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
       }, 30_000)
     };
     activeVoiceRecorder = recorderState;
-    socket?.send(JSON.stringify({
-      type: "start",
-      sampleRate: context.sampleRate
-    }));
     worker?.postMessage({ type: "reset" });
+    if (socket) {
+      const activeSocket = socket;
+      await new Promise<void>((resolve, reject) => {
+        activeSocket.addEventListener("open", () => resolve(), { once: true });
+        activeSocket.addEventListener("error", () => reject(new Error("Voice stream could not connect.")), { once: true });
+      });
+      activeSocket.send(JSON.stringify({
+        type: "start",
+        sampleRate: context.sampleRate
+      }));
+    }
     setVoiceButtonState(button, selectedEngine === "browser" && browserMoonshineStatus === "loading" ? "loading" : "recording");
   } catch (error) {
     socket?.close();
@@ -4735,6 +5414,15 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
       browserMoonshineActiveHandler = undefined;
     } else {
       worker?.terminate();
+    }
+    window.clearTimeout(recorderState?.timeout);
+    window.clearInterval(recorderState?.flushInterval);
+    captureNode?.disconnect();
+    source?.disconnect();
+    stream?.getTracks().forEach((track) => track.stop());
+    await context?.close().catch(() => undefined);
+    if (activeVoiceRecorder === recorderState) {
+      activeVoiceRecorder = undefined;
     }
     throw error;
   }
@@ -4790,8 +5478,11 @@ async function stopVoiceRecording(state = activeVoiceRecorder) {
 }
 
 async function toggleVoiceRecordingForButton(button: HTMLButtonElement) {
-  const form = button.closest<HTMLFormElement>("form");
-  const voiceInput = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+  if (pendingVoiceStart) {
+    return;
+  }
+
+  const voiceInput = voiceTargetInput();
   if (!voiceInput) {
     return;
   }
@@ -4808,21 +5499,26 @@ async function toggleVoiceRecordingForButton(button: HTMLButtonElement) {
   }
 
   try {
-    await startVoiceRecording(button, voiceInput);
+    pendingVoiceStart = startVoiceRecording(button, voiceInput);
+    await pendingVoiceStart;
   } catch (error) {
     console.error(error);
     window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
+  } finally {
+    pendingVoiceStart = undefined;
   }
 }
 
-function voiceButtonForInput(searchInput: CommandField | undefined) {
-  const block = searchInput?.closest<HTMLElement>(".entry, .current-command");
-  return block?.querySelector<HTMLButtonElement>(".voice-button");
+function voiceTargetInput() {
+  return activeSearchInput()
+    ?? (lastVoiceInput?.isConnected ? lastVoiceInput : undefined)
+    ?? input
+    ?? undefined;
 }
 
 function activeVoiceButton() {
-  return voiceButtonForInput(activeSearchInput())
-    ?? voiceButtonForInput(input ?? undefined)
+  return document.querySelector<HTMLButtonElement>("#voice-button")
+    ?? document.querySelector<HTMLButtonElement>(".site-header .voice-button")
     ?? document.querySelector<HTMLButtonElement>(".voice-button")
     ?? undefined;
 }
@@ -4842,13 +5538,14 @@ function bindVoiceButtons(root: ParentNode = document) {
       return;
     }
     button.dataset.voiceBound = "true";
-    let clickTimer: number | undefined;
-    button.addEventListener("mousedown", (event) => {
+    if (!button.dataset.voiceHint) {
+      setVoiceButtonState(button, "idle");
+    }
+    button.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) {
         return;
       }
-      const form = button.closest<HTMLFormElement>("form");
-      const voiceInput = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+      const voiceInput = voiceTargetInput();
       if (!voiceInput) {
         return;
       }
@@ -4856,15 +5553,17 @@ function bindVoiceButtons(root: ParentNode = document) {
       event.preventDefault();
       focusCommandInput(voiceInput, selection);
     });
-    button.addEventListener("click", () => {
-      window.clearTimeout(clickTimer);
-      clickTimer = window.setTimeout(() => {
-        void toggleVoiceRecordingForButton(button);
-      }, 220);
+    button.addEventListener("click", (event) => {
+      if (event.detail > 1) {
+        return;
+      }
+      void toggleVoiceRecordingForButton(button);
     });
-    button.addEventListener("dblclick", (event) => {
+    button.addEventListener("dblclick", async (event) => {
       event.preventDefault();
-      window.clearTimeout(clickTimer);
+      if (activeVoiceRecorder?.button === button) {
+        await stopVoiceRecording(activeVoiceRecorder);
+      }
       openVoiceMenu(button);
     });
   });
@@ -4928,7 +5627,7 @@ function appendEmptyTurnInput(entry: HTMLElement) {
   return turnInput;
 }
 
-function enqueueAiTurn(entry: HTMLElement, turn: HTMLElement, query: string, body: HTMLElement, effort: EffortLevel) {
+function enqueueAiTurn(entry: HTMLElement, turn: HTMLElement, query: string, body: HTMLElement, effort: EffortLevel, lucky?: LuckySubmit) {
   const previous = aiRunQueues.get(entry);
   if (previous) {
     body.innerHTML = `<div class="status">Queued</div>`;
@@ -4941,7 +5640,7 @@ function enqueueAiTurn(entry: HTMLElement, turn: HTMLElement, query: string, bod
         return;
       }
       const thread = aiThreadContext(entry, turn);
-      await runAiPrompt(query, body, effort, thread.turns.length > 0 ? thread : undefined);
+      await runAiPrompt(query, body, effort, thread.turns.length > 0 ? thread : undefined, lucky);
     });
 
   aiRunQueues.set(entry, run);
@@ -4975,10 +5674,13 @@ document.addEventListener("submit", async (event) => {
   }
 
   event.preventDefault();
+  const lucky = luckySubmits.get(submittedForm);
+  luckySubmits.delete(submittedForm);
 
   const searchInput = submittedForm.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
   const query = searchInput?.value.trim() ?? "";
   if (!query || !searchInput || !transcript) {
+    failLuckyTarget(lucky, "Nothing to open.");
     return;
   }
 
@@ -4999,7 +5701,7 @@ document.addEventListener("submit", async (event) => {
     clearSuggestionsFor(searchInput);
     suggestAbort?.abort();
     appendEmptyTurnInput(entry);
-    void enqueueAiTurn(entry, turn, query, body, entryEffort);
+    void enqueueAiTurn(entry, turn, query, body, entryEffort, lucky);
     return;
   }
 
@@ -5012,6 +5714,7 @@ document.addEventListener("submit", async (event) => {
         entry.dataset.originalQuery = query;
       }
       if (slashCommandForQuery(query)) {
+        failLuckyTarget(lucky, "Lucky open is available for search and AI prompts.");
         await runSlashCommand(query, results, searchInput);
       } else if (entry?.dataset.mode === "ai") {
         results.innerHTML = "";
@@ -5025,11 +5728,11 @@ document.addEventListener("submit", async (event) => {
           appendEmptyTurnInput(entry);
           const turn = body.closest<HTMLElement>(".ai-turn");
           if (turn) {
-            void enqueueAiTurn(entry, turn, query, body, entryEffort);
+            void enqueueAiTurn(entry, turn, query, body, entryEffort, lucky);
           }
         }
       } else {
-        await runSearch(query, results, entryEffort);
+        await runSearch(query, results, entryEffort, lucky);
         renumberSuggestionShortcuts(searchInput);
       }
     }
@@ -5067,10 +5770,16 @@ document.addEventListener("submit", async (event) => {
   suggestAbort?.abort();
   setCommandMode(submittedMode);
   if (submittedMode === "ai") {
-    searchInput.blur();
-  } else {
+    if (!lucky) {
+      searchInput.blur();
+    }
+  } else if (!lucky) {
     searchInput.focus();
-    scrollToPrompt();
+    if (isMobileViewport()) {
+      scrollToSubmittedEntry(node);
+    } else {
+      scrollToPrompt();
+    }
   }
 
   const results = node.querySelector<HTMLElement>(".results");
@@ -5078,6 +5787,7 @@ document.addEventListener("submit", async (event) => {
   if (results) {
     const persistedInput = node.querySelector<CommandField>(".entry-input");
     if (submittedSlashCommand && persistedInput) {
+      failLuckyTarget(lucky, "Lucky open is available for search and AI prompts.");
       await runSlashCommand(query, results, persistedInput);
     } else if (submittedMode === "ai") {
       // The conversation owns the message as turn 1; clear the created entry's
@@ -5093,18 +5803,22 @@ document.addEventListener("submit", async (event) => {
         appendEmptyTurnInput(createdEntry);
         const turn = body.closest<HTMLElement>(".ai-turn");
         if (turn) {
-          void enqueueAiTurn(createdEntry, turn, query, body, submittedEffort);
+          void enqueueAiTurn(createdEntry, turn, query, body, submittedEffort, lucky);
         }
       }
     } else {
-      await runSearch(query, results, submittedEffort);
+      await runSearch(query, results, submittedEffort, lucky);
       if (persistedInput) {
         renumberSuggestionShortcuts(persistedInput);
       }
     }
   }
-  if (submittedMode !== "ai") {
-    scrollToPrompt();
+  if (submittedMode !== "ai" && !lucky) {
+    if (isMobileViewport()) {
+      scrollToSubmittedEntry(node);
+    } else {
+      scrollToPrompt();
+    }
   }
 });
 

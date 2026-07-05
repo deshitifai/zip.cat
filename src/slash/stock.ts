@@ -1,7 +1,8 @@
 import type { CacheDescriptor, JsonSchema, SlashCommandArgument } from "../models";
 import { MINUTE_MS } from "../cache";
-import { LookupSlashCommand, type ImplicitMatch, type SlashCommandContext } from "./base";
+import { StockSlashCommand, type ImplicitMatch, type SlashCommandContext } from "./base";
 import { DEFAULT_INSTALL_CONFIG, type InstallConfig } from "./install";
+import { isKnownTicker } from "./tickers";
 
 type StockArgs = {
   symbol: string;
@@ -15,12 +16,16 @@ export type StockOutput = {
   changePercent: number;
   previousClose: number;
   asOf: string;
+  sparkline: Array<{
+    date: string;
+    close: number;
+  }>;
   source: { name: string; url: string };
 };
 
 export const stockOutputSchema = {
   type: "object",
-  required: ["symbol", "price", "currency", "change", "changePercent", "previousClose", "asOf", "source"],
+  required: ["symbol", "price", "currency", "change", "changePercent", "previousClose", "asOf", "sparkline", "source"],
   properties: {
     symbol: { type: "string" },
     price: { type: "number" },
@@ -29,6 +34,17 @@ export const stockOutputSchema = {
     changePercent: { type: "number" },
     previousClose: { type: "number" },
     asOf: { type: "string" },
+    sparkline: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["date", "close"],
+        properties: {
+          date: { type: "string" },
+          close: { type: "number" }
+        }
+      }
+    },
     source: {
       type: "object",
       required: ["name", "url"],
@@ -40,25 +56,38 @@ export const stockOutputSchema = {
   }
 } satisfies JsonSchema;
 
-// Common English words that happen to be valid-looking tickers — we don't want
-// "in", "to", "as", "the" implicitly firing a stock lookup. Keep this list to
-// short, high-frequency words that collide with the 1–5 letter ticker shape.
+// Common English words that collide with real ticker symbols — we don't want
+// lowercase "cat" (CAT), "all" (ALL), or "now" (NOW) implicitly firing a stock
+// lookup while someone types a normal search. Typing the uppercase form is a
+// deliberate signal and bypasses this list.
 const TICKER_STOPWORDS = new Set([
   "a", "i", "in", "to", "as", "is", "it", "at", "of", "on", "or", "be", "do",
   "go", "no", "so", "up", "us", "we", "the", "and", "for", "are", "but", "not",
   "you", "all", "can", "her", "was", "one", "our", "out", "day", "get", "has",
   "him", "his", "how", "man", "new", "now", "old", "see", "two", "way", "who",
-  "boy", "did", "its", "let", "put", "say", "she", "too", "use", "pi", "qt"
+  "boy", "did", "its", "let", "put", "say", "she", "too", "use", "pi", "qt",
+  "ai", "arm", "ball", "cat", "cost", "fast", "key", "keys", "low", "mar",
+  "met", "net", "open", "snap", "snow", "spot", "tap", "team", "well"
 ]);
 
 export function looksLikeTicker(token: string): boolean {
-  // 1–5 letters, optionally with a dot-suffix exchange ("BRK.B"). Uppercase
-  // form is the strong signal; lowercase requires it not be a stopword.
+  // Shape: 1–5 letters, optionally with a dot-suffix class ("BRK.B") — and the
+  // symbol must be a known, listed ticker (see ./tickers.ts). Uppercase form is
+  // the strong signal; lowercase additionally requires it not be a common word.
   if (!/^[A-Za-z]{1,5}(?:\.[A-Za-z]{1,2})?$/.test(token)) {
     return false;
   }
-  const bare = token.split(".")[0]!.toLowerCase();
-  return !TICKER_STOPWORDS.has(bare);
+  if (!isKnownTicker(token)) {
+    return false;
+  }
+  if (token === token.toUpperCase()) {
+    return true;
+  }
+  // Single lowercase letters ("f", "u") are typing fragments, not tickers.
+  if (token.length === 1) {
+    return false;
+  }
+  return !TICKER_STOPWORDS.has(token.split(".")[0]!.toLowerCase());
 }
 
 // Yahoo Finance's chart endpoint is key-less and returns price + previous close
@@ -68,6 +97,10 @@ interface QuoteData {
   previousClose: number;
   currency: string;
   asOf: string;
+  sparkline: Array<{
+    date: string;
+    close: number;
+  }>;
 }
 
 interface YahooChartMeta {
@@ -80,13 +113,21 @@ interface YahooChartMeta {
 
 interface YahooChartResponse {
   chart?: {
-    result?: Array<{ meta?: YahooChartMeta }>;
+    result?: Array<{
+      meta?: YahooChartMeta;
+      timestamp?: number[];
+      indicators?: {
+        quote?: Array<{
+          close?: Array<number | null>;
+        }>;
+      };
+    }>;
     error?: { description?: string } | null;
   };
 }
 
 async function fetchQuote(symbol: string): Promise<QuoteData> {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo`;
   const response = await fetch(url, {
     headers: { "user-agent": "zip.cat/0.1" },
     signal: AbortSignal.timeout(6000)
@@ -98,19 +139,44 @@ async function fetchQuote(symbol: string): Promise<QuoteData> {
   if (payload.chart?.error) {
     throw new Error(payload.chart.error.description ?? `No quote for ${symbol}.`);
   }
-  const meta = payload.chart?.result?.[0]?.meta;
+  const result = payload.chart?.result?.[0];
+  const meta = result?.meta;
   const price = meta?.regularMarketPrice;
-  const previousClose = meta?.chartPreviousClose ?? meta?.previousClose;
-  if (typeof price !== "number" || typeof previousClose !== "number") {
+  if (typeof price !== "number") {
     throw new Error(`No quote available for ${symbol}.`);
   }
+  const closes = result?.indicators?.quote?.[0]?.close ?? [];
+  const timestamps = result?.timestamp ?? [];
+  let sparkline = closes
+    .map((close, index) => {
+      if (typeof close !== "number" || !Number.isFinite(close)) {
+        return undefined;
+      }
+      const timestamp = timestamps[index];
+      return {
+        date: typeof timestamp === "number" ? new Date(timestamp * 1000).toISOString().slice(0, 10) : "",
+        close: Number(close.toFixed(4))
+      };
+    })
+    .filter((point): point is { date: string; close: number } => Boolean(point));
   const asOf = meta?.regularMarketTime
     ? new Date(meta.regularMarketTime * 1000).toISOString().slice(0, 10)
-    : "";
-  return { price, previousClose, currency: meta?.currency ?? "USD", asOf };
+    : sparkline.at(-1)?.date ?? "";
+  const latestSparklineClose = sparkline.at(-1)?.close;
+  if (typeof latestSparklineClose !== "number" || Math.abs(latestSparklineClose - price) > 0.0001) {
+    sparkline = [...sparkline, { date: asOf, close: Number(price.toFixed(4)) }];
+  }
+  const previousSparklineClose = sparkline.length >= 2
+    ? sparkline[sparkline.length - 2]?.close
+    : undefined;
+  const previousClose = meta?.previousClose ?? previousSparklineClose ?? meta?.chartPreviousClose;
+  if (typeof previousClose !== "number") {
+    throw new Error(`No quote available for ${symbol}.`);
+  }
+  return { price, previousClose, currency: meta?.currency ?? "USD", asOf, sparkline };
 }
 
-export class StockCommand extends LookupSlashCommand<StockArgs, StockOutput> {
+export class StockCommand extends StockSlashCommand<StockArgs, StockOutput> {
   readonly id = "slash.stock";
   readonly name = "Stock";
   readonly command = "/stock";
@@ -140,28 +206,16 @@ export class StockCommand extends LookupSlashCommand<StockArgs, StockOutput> {
 
   detectImplicit(query: string): ImplicitMatch<StockArgs> | undefined {
     const trimmed = query.trim();
-    // Only the FIRST token, and only when it's alone or clearly a ticker query.
-    const tokens = trimmed.split(/\s+/);
-    const first = tokens[0] ?? "";
-    if (!looksLikeTicker(first)) {
+    // Implicit stock pickup is intentionally strict: the whole input must be a
+    // ticker token. Phrases like "MSFT stock" should remain normal searches.
+    if (!looksLikeTicker(trimmed)) {
       return undefined;
     }
-    // A lone uppercase token ("MSFT") is a strong signal; a lone lowercase token
-    // ("msft") is moderate; a ticker followed by other words is weak (likely
-    // prose) unless the trailing word is "stock"/"price"/"quote".
-    const isUpper = first === first.toUpperCase();
-    let confidence: number;
-    if (tokens.length === 1) {
-      confidence = isUpper ? 0.9 : 0.6;
-    } else if (/\b(stock|price|quote|share|shares)\b/i.test(trimmed)) {
-      confidence = 0.8;
-    } else {
-      return undefined;
-    }
+    const isUpper = trimmed === trimmed.toUpperCase();
     return {
-      confidence,
-      args: { symbol: first.toUpperCase() },
-      label: `${first.toUpperCase()} quote`
+      confidence: isUpper ? 0.9 : 0.6,
+      args: { symbol: trimmed.toUpperCase() },
+      label: `${trimmed.toUpperCase()} quote`
     };
   }
 
@@ -187,6 +241,7 @@ export class StockCommand extends LookupSlashCommand<StockArgs, StockOutput> {
       changePercent: Number(changePercent.toFixed(2)),
       previousClose: quote.previousClose,
       asOf: quote.asOf,
+      sparkline: quote.sparkline,
       source: { name: "Yahoo Finance", url: `https://finance.yahoo.com/quote/${encodeURIComponent(args.symbol)}` }
     };
   }

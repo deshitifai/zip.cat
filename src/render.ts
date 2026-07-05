@@ -1,7 +1,10 @@
 import type { SearchResponse } from "./models";
 import { MESSAGES, DEFAULT_LOCALE, translate, type Locale, type MessageKey } from "./i18n";
+import { resultFormatForQuery, resultFormatIndicatorMarkup } from "./resultFormat";
+import { typedOutputDescriptors } from "./typedOutputs";
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
+const typedOutputs = typedOutputDescriptors();
 
 // SSR renders in the default locale; the client re-applies the URL's ?lang= on
 // load (and on switch) via the inline script + the shared i18n catalog.
@@ -23,6 +26,7 @@ function applyI18n(){
   document.querySelectorAll("[data-i18n]").forEach((node)=>{node.textContent=t(node.dataset.i18n);});
   document.querySelectorAll("[data-i18n-title]").forEach((node)=>{node.setAttribute("title",t(node.dataset.i18nTitle));});
   document.querySelectorAll("[data-i18n-aria]").forEach((node)=>{node.setAttribute("aria-label",t(node.dataset.i18nAria));});
+  document.querySelectorAll("[data-i18n-voice-hint]").forEach((node)=>{node.dataset.voiceHint=t(node.dataset.i18nVoiceHint);});
   document.dispatchEvent(new CustomEvent("zip:i18n",{detail:{locale:activeLocale}}));
 }
 function setLocale(locale){if(!LOCALES.includes(locale)||locale===activeLocale)return;activeLocale=locale;const nextUrl=new URL(location.href);nextUrl.searchParams.set("lang",activeLocale);history.replaceState(null,"",nextUrl);applyI18n();}
@@ -124,7 +128,7 @@ function renderEntry(options: {
           <textarea class="entry-input" aria-label="${t("previousSearch")}" data-i18n-aria="previousSearch" name="q" rows="1">${query}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
-        <button class="voice-button" type="button" aria-label="${t("voiceInput")}" data-i18n-aria="voiceInput" title="${t("voiceInputTitle")}" data-i18n-title="voiceInputTitle">●</button>
+        ${resultFormatIndicatorMarkup(resultFormatForQuery(options.query, "search", typedOutputs))}
         <div class="slash-args" hidden></div>
       </form>
       <div class="results">
@@ -154,6 +158,7 @@ ${pageStyles}  </style>
 </head>
 <body>
   <header class="site-header">
+    <button id="voice-button" class="voice-button" type="button" aria-label="${t("voiceInput")}" data-i18n-aria="voiceInput" title="${t("voiceInputTitle")}" data-i18n-title="voiceInputTitle" data-voice-hint="${t("voiceInputHint")}" data-i18n-voice-hint="voiceInputHint">●</button>
     <select id="lang-select" class="lang-select" aria-label="${t("languageLabel")}" data-i18n-aria="languageLabel">
       <option value="en" lang="en">EN</option>
       <option value="ca" lang="ca">CA</option>
@@ -178,7 +183,7 @@ ${pageStyles}  </style>
             <textarea autofocus aria-label="${t("searchAria")}" data-i18n-aria="searchAria" name="q" rows="1"></textarea>
             <span class="inline-inference-highlight" aria-hidden="true"></span>
           </span>
-          <button class="voice-button" type="button" aria-label="${t("voiceInput")}" data-i18n-aria="voiceInput" title="${t("voiceInputTitle")}" data-i18n-title="voiceInputTitle">●</button>
+          ${resultFormatIndicatorMarkup(resultFormatForQuery("", "search", typedOutputs))}
           <div class="slash-args" hidden></div>
         </form>
       </section>
@@ -215,7 +220,7 @@ export const pageStyles = `    * { box-sizing: border-box; }
       background: #fff;
       border-bottom: 1px solid #111;
       display: flex;
-      justify-content: flex-end;
+      justify-content: space-between;
       align-items: center;
       padding: 6px 16px;
     }
@@ -261,6 +266,7 @@ export const pageStyles = `    * { box-sizing: border-box; }
       margin-bottom: 18px;
       padding: 32px 12px 12px;
       position: relative;
+      scroll-margin-top: 52px;
     }
     .current-command {
       border: 1px solid #d8d8d8;
@@ -356,7 +362,7 @@ export const pageStyles = `    * { box-sizing: border-box; }
       cursor: pointer;
       display: grid;
       gap: 2px;
-      grid-template-columns: 70px minmax(0, 1fr);
+      grid-template-columns: 34px minmax(0, 1fr);
       min-height: 34px;
       padding: 6px 8px;
       text-align: left;
@@ -368,6 +374,13 @@ export const pageStyles = `    * { box-sizing: border-box; }
     .effort-menu-level {
       font-size: 13px;
       line-height: 1.25;
+    }
+    .effort-menu-bars {
+      align-items: end;
+      display: inline-flex;
+      gap: 2px;
+      height: 12px;
+      margin-top: 1px;
     }
     .effort-menu-detail {
       color: #444;
@@ -603,21 +616,80 @@ export const pageStyles = `    * { box-sizing: border-box; }
       line-height: 24px;
       margin: 0;
       padding: 0 2px;
+      position: relative;
       text-align: center;
       width: 16px;
     }
-    .voice-button:hover,
-    .voice-button.recording {
-      color: #111;
+    .voice-button::after {
+      background: #111;
+      border: 1px solid #111;
+      color: #fff;
+      content: attr(data-voice-hint);
+      font-size: 12px;
+      left: 50%;
+      line-height: 1.25;
+      max-width: min(260px, calc(100vw - 24px));
+      min-width: 190px;
+      opacity: 0;
+      padding: 7px 8px;
+      pointer-events: none;
+      position: absolute;
+      text-align: left;
+      top: calc(100% + 8px);
+      transform: translateX(-50%) translateY(-2px);
+      transition: opacity 120ms ease, transform 120ms ease;
+      white-space: normal;
+      z-index: 35;
     }
-    .voice-button.recording {
-      animation: ai-phase-pulse 620ms linear infinite;
+    .voice-button::before {
+      border-color: transparent transparent #111;
+      border-style: solid;
+      border-width: 0 5px 6px;
+      content: "";
+      left: 50%;
+      opacity: 0;
+      pointer-events: none;
+      position: absolute;
+      top: calc(100% + 2px);
+      transform: translateX(-50%) translateY(-2px);
+      transition: opacity 120ms ease, transform 120ms ease;
+      z-index: 36;
     }
+    .voice-button:not([data-voice-hint])::before,
+    .voice-button:not([data-voice-hint])::after {
+      display: none;
+    }
+    .site-header .voice-button {
+      grid-column: auto;
+      grid-row: auto;
+      height: 24px;
+      width: 24px;
+    }
+    .site-header .voice-button::after {
+      left: 0;
+      transform: translateY(-2px);
+    }
+    .voice-button.loading,
     .voice-button.transcribing {
-      animation: search-phase-pulse 620ms linear infinite;
+      color: #0057ff;
+    }
+    .voice-button.ready,
+    .voice-button.recording {
+      color: #137333;
+    }
+    .voice-button:hover::before,
+    .voice-button:hover::after,
+    .voice-button:focus-visible::before,
+    .voice-button:focus-visible::after {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+    .site-header .voice-button:hover::after,
+    .site-header .voice-button:focus-visible::after {
+      transform: translateY(0);
     }
     .voice-button.error {
-      color: #b00020;
+      color: #777;
     }
     .voice-menu {
       background: #fff;
@@ -653,8 +725,201 @@ export const pageStyles = `    * { box-sizing: border-box; }
       color: #555;
       font-size: 12px;
     }
-    .entry-form:has(.slash-args:not([hidden])) .voice-button,
-    #terminal-form:has(.slash-args:not([hidden])) .voice-button {
+    .format-indicator {
+      color: #111;
+      cursor: pointer;
+      display: inline-grid;
+      grid-column: 3;
+      grid-row: 1;
+      height: 24px;
+      place-items: center;
+      width: 18px;
+    }
+    .format-indicator:hover,
+    .format-indicator:focus-visible {
+      background: #f2f2f2;
+      outline: 1px solid #111;
+    }
+    .format-icon {
+      color: #111;
+      display: block;
+      height: 16px;
+      position: relative;
+      width: 16px;
+    }
+    .format-icon-list,
+    .format-icon-string {
+      align-content: center;
+      display: grid;
+      gap: 3px;
+    }
+    .format-icon-list span,
+    .format-icon-string span {
+      background: #111;
+      display: block;
+      height: 1px;
+    }
+    .format-icon-list span:nth-child(1) { width: 14px; }
+    .format-icon-list span:nth-child(2) { width: 11px; }
+    .format-icon-list span:nth-child(3) { width: 13px; }
+    .format-icon-string span {
+      width: 13px;
+    }
+    .format-icon-string::before,
+    .format-icon-string::after {
+      content: "";
+      position: absolute;
+      top: 5px;
+      width: 2px;
+      height: 4px;
+      border-top: 1px solid #111;
+    }
+    .format-icon-string::before {
+      left: 0;
+      border-left: 1px solid #111;
+    }
+    .format-icon-string::after {
+      right: 0;
+      border-right: 1px solid #111;
+    }
+    .format-icon-boolean {
+      border: 1px solid #111;
+      height: 12px;
+      margin: 2px;
+      width: 12px;
+    }
+    .format-icon-boolean::after {
+      border-bottom: 1px solid #111;
+      border-right: 1px solid #111;
+      content: "";
+      height: 7px;
+      left: 4px;
+      position: absolute;
+      top: 0;
+      transform: rotate(38deg);
+      width: 4px;
+    }
+    .format-icon-url::before,
+    .format-icon-url::after {
+      border: 1px solid #111;
+      border-radius: 8px;
+      content: "";
+      height: 7px;
+      position: absolute;
+      top: 4px;
+      width: 9px;
+    }
+    .format-icon-url::before {
+      left: 1px;
+      transform: rotate(-28deg);
+    }
+    .format-icon-url::after {
+      right: 1px;
+      transform: rotate(-28deg);
+    }
+    .format-icon-restaurant {
+      border: 1px solid #111;
+      height: 13px;
+      margin: 1px;
+      width: 14px;
+    }
+    .format-icon-restaurant::before {
+      background: #111;
+      content: "";
+      height: 1px;
+      left: 2px;
+      position: absolute;
+      top: 4px;
+      width: 10px;
+    }
+    .format-icon-restaurant::after {
+      background: #111;
+      content: "";
+      height: 3px;
+      left: 2px;
+      position: absolute;
+      top: 8px;
+      width: 3px;
+    }
+    .format-icon-restaurant-list span {
+      border: 1px solid #111;
+      display: block;
+      height: 4px;
+      margin-bottom: 2px;
+      width: 14px;
+    }
+    .format-icon-json {
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 16px;
+      text-align: center;
+    }
+    .format-menu {
+      background: #fff;
+      border: 1px solid #111;
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
+      display: flex;
+      flex-direction: column;
+      max-width: min(420px, calc(100vw - 16px));
+      min-width: 320px;
+      padding: 4px;
+      position: fixed;
+      z-index: 20;
+    }
+    .format-menu-search {
+      background: #fff;
+      border: 0;
+      border-bottom: 1px solid #ddd;
+      color: #111;
+      font: inherit;
+      font-size: 13px;
+      margin-bottom: 4px;
+      outline: none;
+      padding: 6px 8px;
+      width: 100%;
+    }
+    .format-menu-options {
+      display: flex;
+      flex-direction: column;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+    .format-menu-option {
+      appearance: none;
+      background: #fff;
+      border: 0;
+      color: #111;
+      column-gap: 8px;
+      cursor: pointer;
+      display: grid;
+      grid-template-columns: 20px minmax(0, 1fr);
+      min-height: 34px;
+      padding: 6px 8px;
+      text-align: left;
+    }
+    .format-menu-option:hover,
+    .format-menu-option.active {
+      background: #f2f2f2;
+    }
+    .format-menu-icon {
+      align-self: center;
+      display: inline-grid;
+      grid-row: 1 / span 2;
+      place-items: center;
+    }
+    .format-menu-name {
+      font-size: 13px;
+      line-height: 1.25;
+    }
+    .format-menu-detail {
+      color: #444;
+      font-size: 12px;
+      grid-column: 2;
+      line-height: 1.25;
+      min-width: 0;
+    }
+    .entry-form:has(.slash-args:not([hidden])) .format-indicator,
+    #terminal-form:has(.slash-args:not([hidden])) .format-indicator {
       grid-column: 5;
     }
     .entry-form:has(.slash-args:not([hidden])) .input-shell,
@@ -682,14 +947,13 @@ export const pageStyles = `    * { box-sizing: border-box; }
       width: 100%;
       z-index: 2;
     }
-    .entry.command-highlight-active .entry-input,
-    .current-command.command-highlight-active textarea {
+    .input-shell.command-highlight-active .entry-input,
+    .input-shell.command-highlight-active textarea {
       color: transparent;
       caret-color: #111;
       text-shadow: none;
     }
-    .entry.command-highlight-active .inline-inference-highlight,
-    .current-command.command-highlight-active .inline-inference-highlight {
+    .input-shell.command-highlight-active .inline-inference-highlight {
       display: block;
     }
     .inline-inference-glow {
@@ -1120,6 +1384,74 @@ export const pageStyles = `    * { box-sizing: border-box; }
       font-size: 11px;
       font-weight: 600;
     }
+    .stock-card {
+      display: grid;
+      gap: 8px;
+      font-size: 15px;
+      line-height: 1.35;
+    }
+    .stock-topline {
+      align-items: center;
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(120px, max-content) minmax(132px, 164px);
+    }
+    .stock-symbol {
+      color: #555;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0;
+    }
+    .stock-price {
+      color: #111;
+      font-size: 30px;
+      line-height: 1.05;
+      white-space: nowrap;
+    }
+    .stock-meta {
+      align-items: baseline;
+      color: #777;
+      display: flex;
+      flex-wrap: wrap;
+      font-size: 12px;
+      gap: 6px 12px;
+    }
+    .stock-meta a {
+      color: inherit;
+      text-decoration: underline;
+    }
+    .stock-change {
+      color: #666;
+      font-variant-numeric: tabular-nums;
+    }
+    .stock-up .stock-change {
+      color: #137333;
+    }
+    .stock-down .stock-change {
+      color: #b3261e;
+    }
+    .stock-sparkline {
+      display: block;
+      height: 42px;
+      overflow: visible;
+      width: 164px;
+    }
+    .stock-sparkline polyline {
+      fill: none;
+      stroke: #777;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 2;
+    }
+    .stock-sparkline-up polyline {
+      stroke: #137333;
+    }
+    .stock-sparkline-down polyline {
+      stroke: #b3261e;
+    }
+    .stock-sparkline-empty {
+      border-bottom: 1px solid #d8d8d8;
+    }
     .weather-card {
       display: grid;
       gap: 10px;
@@ -1358,8 +1690,12 @@ export const pageStyles = `    * { box-sizing: border-box; }
       }
       .weather-metrics,
       .weather-day,
+      .stock-topline,
       .restaurant-card {
         grid-template-columns: 1fr;
+      }
+      .stock-sparkline {
+        max-width: 100%;
       }
     }
 `;

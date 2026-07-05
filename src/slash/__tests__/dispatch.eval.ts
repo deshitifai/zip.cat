@@ -31,6 +31,14 @@ export const dispatchSuite: Suite = {
       report.ok("ticker → stock");
     }
 
+    // Ticker-looking first words inside phrases remain normal search text.
+    const stockPhrase = detectImplicitCommand("MSFT stock");
+    if (stockPhrase?.commandId === "slash.stock") {
+      report.fail('"MSFT stock" should not implicit-match stock');
+    } else {
+      report.ok("ticker phrase not stock");
+    }
+
     // Explicit slash → no implicit.
     if (detectImplicitCommand("/calc 2+2")) {
       report.fail("slash input should not implicit-match");
@@ -51,6 +59,40 @@ export const dispatchSuite: Suite = {
       report.fail('"in" should not be a ticker');
     } else {
       report.ok("stopword not ticker");
+    }
+
+    // Ticker-shaped words that aren't listed symbols stay normal searches.
+    for (const word of ["hello", "zzzzz", "QXJW"]) {
+      const match = detectImplicitCommand(word);
+      if (match?.commandId === "slash.stock") {
+        report.fail(`"${word}" is not a known ticker and should not match stock`);
+      } else {
+        report.ok(`unknown symbol "${word}" not ticker`);
+      }
+    }
+
+    // Uppercase form of a word-colliding ticker is a deliberate signal.
+    const catUpper = detectImplicitCommand("CAT");
+    if (catUpper?.commandId !== "slash.stock") {
+      report.fail('detectImplicit("CAT") → stock', catUpper?.commandId);
+    } else {
+      report.ok("uppercase CAT → stock");
+    }
+
+    // ...but the lowercase common word stays a search.
+    const catLower = detectImplicitCommand("cat");
+    if (catLower?.commandId === "slash.stock") {
+      report.fail('"cat" should not be a ticker');
+    } else {
+      report.ok("lowercase cat not ticker");
+    }
+
+    // Dot-suffixed share classes are known tickers too.
+    const brk = detectImplicitCommand("BRK.B");
+    if (brk?.commandId !== "slash.stock") {
+      report.fail('detectImplicit("BRK.B") → stock', brk?.commandId);
+    } else {
+      report.ok("BRK.B → stock");
     }
   }
 };
@@ -121,7 +163,7 @@ export const installConfigSuite: Suite = {
     }
 
     // Raising minConfidence above a match's confidence filters it out.
-    const strict = detectImplicitCommand("MSFT INC", {
+    const strict = detectImplicitCommand("msft", {
       "slash.stock": { implicit: { minConfidence: 0.99 } }
     });
     if (strict?.commandId === "slash.stock") {

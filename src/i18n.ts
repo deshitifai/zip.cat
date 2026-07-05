@@ -18,6 +18,11 @@ export type MessageKey =
   | "aiPrompt"
   | "voiceInput"
   | "voiceInputTitle"
+  | "voiceInputHint"
+  | "voiceInputLoadingHint"
+  | "voiceInputRecordingHint"
+  | "voiceInputTranscribingHint"
+  | "voiceInputErrorHint"
   | "voiceMenuBrowser"
   | "voiceMenuServer"
   | "refresh"
@@ -60,6 +65,11 @@ const en: Messages = {
   aiPrompt: "AI prompt",
   voiceInput: "Voice input",
   voiceInputTitle: "Voice input with Moonshine",
+  voiceInputHint: "Click to start voice input. Double-click to choose engine.",
+  voiceInputLoadingHint: "Starting voice input",
+  voiceInputRecordingHint: "Click to stop voice input",
+  voiceInputTranscribingHint: "Transcribing with Moonshine",
+  voiceInputErrorHint: "Voice transcription failed",
   voiceMenuBrowser: "In-browser (Moonshine)",
   voiceMenuServer: "Server",
   refresh: "Refresh",
@@ -103,6 +113,11 @@ const ca: Messages = {
   aiPrompt: "Indicació d'IA",
   voiceInput: "Entrada de veu",
   voiceInputTitle: "Entrada de veu amb Moonshine",
+  voiceInputHint: "Fes clic per iniciar l'entrada de veu. Fes doble clic per triar el motor.",
+  voiceInputLoadingHint: "S'està iniciant l'entrada de veu",
+  voiceInputRecordingHint: "Fes clic per aturar l'entrada de veu",
+  voiceInputTranscribingHint: "S'està transcrivint amb Moonshine",
+  voiceInputErrorHint: "La transcripció de veu ha fallat",
   voiceMenuBrowser: "Al navegador (Moonshine)",
   voiceMenuServer: "Servidor",
   refresh: "Actualitza",

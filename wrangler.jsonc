@@ -1,0 +1,7 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "zip-cat",
+  "pages_build_output_dir": "./dist/static",
+  "compatibility_date": "2026-06-30",
+  "compatibility_flags": ["nodejs_compat"]
+}

@@ -1,4 +1,5 @@
 import type { JsonSchema, SuggestPlugin, Suggestion } from "../models";
+import { isLookupPrefixMatch, isSuggestibleLookupQuery } from "./matching";
 
 export const wiktionaryHeadwordResultSchema = {
   type: "object",
@@ -83,6 +84,9 @@ async function findHeadword(query: string) {
 
   const response = await fetch(`https://en.wiktionary.org/w/api.php?${params}`, {
     headers: {
+      // Cloudflare Workers send no default user-agent and Wikimedia 403s
+      // UA-less requests, so set both headers explicitly.
+      "user-agent": "zip.cat/0.1 (https://zip.cat)",
       "api-user-agent": "zip.cat/0.1 (https://zip.cat)"
     }
   });
@@ -101,6 +105,7 @@ async function findHeadword(query: string) {
 async function findDefinition(title: string) {
   const response = await fetch(`https://en.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(title)}`, {
     headers: {
+      "user-agent": "zip.cat/0.1 (https://zip.cat)",
       "api-user-agent": "zip.cat/0.1 (https://zip.cat)"
     }
   });
@@ -151,13 +156,13 @@ export function wiktionaryHeadwordPlugin(): SuggestPlugin {
         context.request.trigger.source === "search-box";
 
       return {
-        qualified: isInputChange && context.request.query.length >= 2,
+        qualified: isInputChange && isSuggestibleLookupQuery(context.request.query),
         reason: isInputChange ? undefined : "Wiktionary headword matching only fires from command-line input changes."
       };
     },
     async triggerExecute(context) {
       const headword = await findHeadword(context.request.query);
-      if (!headword) {
+      if (!headword || !isLookupPrefixMatch(context.request.query, headword.title)) {
         return {
           pluginId: "wiktionary.headword",
           placement: resultPlacement,

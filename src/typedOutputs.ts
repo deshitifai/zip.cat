@@ -35,6 +35,18 @@ const typedOutputs: TypedOutputDescriptor[] = [
     }
   },
   {
+    id: "url",
+    marker: "#url",
+    name: "url",
+    label: "URL",
+    description: "A single best destination URL.",
+    renderer: "url",
+    schema: {
+      type: "string",
+      format: "uri"
+    }
+  },
+  {
     id: "Restaurant",
     marker: "#Restaurant",
     name: "Restaurant",
