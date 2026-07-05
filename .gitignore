@@ -4,6 +4,8 @@ evals/results/
 node_modules/
 .venv/
 .moonshine-cache/
+.wrangler/
+.DS_Store
 *.log
 .env
 .env.local

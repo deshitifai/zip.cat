@@ -1,10 +1,43 @@
 import type { SearchResponse } from "./models";
+import { MESSAGES, DEFAULT_LOCALE, translate, type Locale, type MessageKey } from "./i18n";
+import { resultFormatForQuery, resultFormatIndicatorMarkup } from "./resultFormat";
+import { typedOutputDescriptors } from "./typedOutputs";
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
+const typedOutputs = typedOutputDescriptors();
+
+// SSR renders in the default locale; the client re-applies the URL's ?lang= on
+// load (and on switch) via the inline script + the shared i18n catalog.
+function t(key: MessageKey, params?: Record<string, string | number>) {
+  return translate(DEFAULT_LOCALE, key, params);
+}
+
+function renderI18nScript() {
+  return `<script>
+const I18N=${JSON.stringify(MESSAGES)};
+const LOCALES=${JSON.stringify(Object.keys(MESSAGES) as Locale[])};
+const DEFAULT_LOCALE=${JSON.stringify(DEFAULT_LOCALE)};
+let activeLocale=(()=>{const l=new URLSearchParams(location.search).get("lang");return l&&LOCALES.includes(l)?l:DEFAULT_LOCALE;})();
+function t(key,params){let s=(I18N[activeLocale]&&I18N[activeLocale][key])||I18N[DEFAULT_LOCALE][key]||key;if(params)for(const k in params)s=s.replace(new RegExp("\\\\{"+k+"\\\\}","g"),String(params[k]));return s;}
+window.__zipI18n={get locale(){return activeLocale;},t:t};
+function applyI18n(){
+  document.documentElement.lang=activeLocale;
+  const select=document.querySelector("#lang-select");if(select)select.value=activeLocale;
+  document.querySelectorAll("[data-i18n]").forEach((node)=>{node.textContent=t(node.dataset.i18n);});
+  document.querySelectorAll("[data-i18n-title]").forEach((node)=>{node.setAttribute("title",t(node.dataset.i18nTitle));});
+  document.querySelectorAll("[data-i18n-aria]").forEach((node)=>{node.setAttribute("aria-label",t(node.dataset.i18nAria));});
+  document.querySelectorAll("[data-i18n-voice-hint]").forEach((node)=>{node.dataset.voiceHint=t(node.dataset.i18nVoiceHint);});
+  document.dispatchEvent(new CustomEvent("zip:i18n",{detail:{locale:activeLocale}}));
+}
+function setLocale(locale){if(!LOCALES.includes(locale)||locale===activeLocale)return;activeLocale=locale;const nextUrl=new URL(location.href);nextUrl.searchParams.set("lang",activeLocale);history.replaceState(null,"",nextUrl);applyI18n();}
+document.addEventListener("change",(event)=>{const target=event.target;if(!(target instanceof HTMLSelectElement)||target.id!=="lang-select")return;setLocale(target.value);});
+applyI18n();
+</script>`;
+}
 
 function renderEffortBars(effort = 3, levels = [1, 2, 3, 4, 5]) {
   const available = new Set(levels);
-  const label = levels.length === 1 ? "DuckDuckGo Instant Answer" : `Effort ${effort} of 5`;
+  const label = levels.length === 1 ? t("effortDdgInstant") : t("effortAriaLevel", { level: effort });
   return `<span class="effort-bars" data-effort="${effort}" aria-label="${label}" title="${label}">${[1, 2, 3, 4, 5]
     .map((level) => {
       const isAvailable = available.has(level);
@@ -14,8 +47,8 @@ function renderEffortBars(effort = 3, levels = [1, 2, 3, 4, 5]) {
         isAvailable ? "" : "unavailable"
       ].filter(Boolean).join(" ");
       const title = isAvailable
-        ? levels.length === 1 ? label : `Effort ${level} of 5`
-        : `Level ${level} is not configured`;
+        ? levels.length === 1 ? label : t("effortLevelPrefix", { level })
+        : t("effortLevelUnconfigured", { level });
       return `<span class="${classes}" data-effort-level="${level}" title="${title}" aria-hidden="true"></span>`;
     })
     .join("")}</span>`;
@@ -90,12 +123,12 @@ function renderEntry(options: {
       <span class="status-label" aria-hidden="true">$0</span>
       ${renderEffortBars(effort, levels)}
       <form class="entry-form" action="/" method="get" autocomplete="off">
-        <span class="prompt" aria-hidden="true">&gt;</span>
+        <span class="prompt prompt-toggle" aria-hidden="true" title="${t("switchMode")}" data-i18n-title="switchMode">&gt;</span>
         <span class="input-shell">
-          <textarea class="entry-input" aria-label="Previous search" name="q" rows="1">${query}</textarea>
+          <textarea class="entry-input" aria-label="${t("previousSearch")}" data-i18n-aria="previousSearch" name="q" rows="1">${query}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
-        <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+        ${resultFormatIndicatorMarkup(resultFormatForQuery(options.query, "search", typedOutputs))}
         <div class="slash-args" hidden></div>
       </form>
       <div class="results">
@@ -124,6 +157,13 @@ export function renderPage(options: {
 ${pageStyles}  </style>
 </head>
 <body>
+  <header class="site-header">
+    <button id="voice-button" class="voice-button" type="button" aria-label="${t("voiceInput")}" data-i18n-aria="voiceInput" title="${t("voiceInputTitle")}" data-i18n-title="voiceInputTitle" data-voice-hint="${t("voiceInputHint")}" data-i18n-voice-hint="voiceInputHint">●</button>
+    <select id="lang-select" class="lang-select" aria-label="${t("languageLabel")}" data-i18n-aria="languageLabel">
+      <option value="en" lang="en">EN</option>
+      <option value="ca" lang="ca">CA</option>
+    </select>
+  </header>
   <main>
     <div id="transcript">
       ${renderEntry({
@@ -138,12 +178,12 @@ ${pageStyles}  </style>
         <span class="status-label" aria-hidden="true">$0</span>
         ${renderEffortBars(options.staticBuild ? 1 : 3, options.staticBuild ? [1] : [1, 2, 3, 4, 5])}
         <form id="terminal-form" action="/" method="get" autocomplete="off">
-          <span class="prompt" aria-hidden="true">&gt;</span>
+          <span class="prompt prompt-toggle" aria-hidden="true" title="${t("switchMode")}" data-i18n-title="switchMode">&gt;</span>
           <span class="input-shell">
-            <textarea autofocus aria-label="Search" name="q" rows="1"></textarea>
+            <textarea autofocus aria-label="${t("searchAria")}" data-i18n-aria="searchAria" name="q" rows="1"></textarea>
             <span class="inline-inference-highlight" aria-hidden="true"></span>
           </span>
-          <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+          ${resultFormatIndicatorMarkup(resultFormatForQuery("", "search", typedOutputs))}
           <div class="slash-args" hidden></div>
         </form>
       </section>
@@ -151,6 +191,7 @@ ${pageStyles}  </style>
     </div>
   </main>
   ${options.staticBuild ? `<script>window.ZIP_CAT_STATIC = true;</script>` : ""}
+  ${renderI18nScript()}
   <script type="module" src="/client.js"></script>
 </body>
 </html>`;
@@ -166,7 +207,41 @@ export const pageStyles = `    * { box-sizing: border-box; }
     main {
       width: min(960px, calc(100vw - 32px));
       margin: 0 auto;
-      padding: 28px 0 48px;
+      /* Top padding clears the fixed header so content starts below it. */
+      padding: calc(36px + 28px) 0 48px;
+    }
+    .site-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      width: 100%;
+      background: #fff;
+      border-bottom: 1px solid #111;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 16px;
+    }
+    .lang-select {
+      background: #fff;
+      border: 1px solid #ccc;
+      color: #111;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      padding: 3px 6px;
+      text-transform: uppercase;
+    }
+    .lang-select:hover {
+      border-color: #111;
+    }
+    .lang-select:focus-visible {
+      outline: 2px solid #111;
+      outline-offset: 1px;
     }
     .query-row {
       display: grid;
@@ -191,6 +266,7 @@ export const pageStyles = `    * { box-sizing: border-box; }
       margin-bottom: 18px;
       padding: 32px 12px 12px;
       position: relative;
+      scroll-margin-top: 52px;
     }
     .current-command {
       border: 1px solid #d8d8d8;
@@ -286,7 +362,7 @@ export const pageStyles = `    * { box-sizing: border-box; }
       cursor: pointer;
       display: grid;
       gap: 2px;
-      grid-template-columns: 70px minmax(0, 1fr);
+      grid-template-columns: 34px minmax(0, 1fr);
       min-height: 34px;
       padding: 6px 8px;
       text-align: left;
@@ -298,6 +374,13 @@ export const pageStyles = `    * { box-sizing: border-box; }
     .effort-menu-level {
       font-size: 13px;
       line-height: 1.25;
+    }
+    .effort-menu-bars {
+      align-items: end;
+      display: inline-flex;
+      gap: 2px;
+      height: 12px;
+      margin-top: 1px;
     }
     .effort-menu-detail {
       color: #444;
@@ -462,6 +545,16 @@ export const pageStyles = `    * { box-sizing: border-box; }
       line-height: 24px;
       transform: none;
     }
+    .prompt-toggle {
+      cursor: pointer;
+      user-select: none;
+      border-radius: 3px;
+      transition: background 0.1s, color 0.1s;
+    }
+    .prompt-toggle:hover {
+      background: #111;
+      color: #fff;
+    }
     input,
     textarea {
       -webkit-appearance: none;
@@ -523,21 +616,80 @@ export const pageStyles = `    * { box-sizing: border-box; }
       line-height: 24px;
       margin: 0;
       padding: 0 2px;
+      position: relative;
       text-align: center;
       width: 16px;
     }
-    .voice-button:hover,
-    .voice-button.recording {
-      color: #111;
+    .voice-button::after {
+      background: #111;
+      border: 1px solid #111;
+      color: #fff;
+      content: attr(data-voice-hint);
+      font-size: 12px;
+      left: 50%;
+      line-height: 1.25;
+      max-width: min(260px, calc(100vw - 24px));
+      min-width: 190px;
+      opacity: 0;
+      padding: 7px 8px;
+      pointer-events: none;
+      position: absolute;
+      text-align: left;
+      top: calc(100% + 8px);
+      transform: translateX(-50%) translateY(-2px);
+      transition: opacity 120ms ease, transform 120ms ease;
+      white-space: normal;
+      z-index: 35;
     }
-    .voice-button.recording {
-      animation: ai-phase-pulse 620ms linear infinite;
+    .voice-button::before {
+      border-color: transparent transparent #111;
+      border-style: solid;
+      border-width: 0 5px 6px;
+      content: "";
+      left: 50%;
+      opacity: 0;
+      pointer-events: none;
+      position: absolute;
+      top: calc(100% + 2px);
+      transform: translateX(-50%) translateY(-2px);
+      transition: opacity 120ms ease, transform 120ms ease;
+      z-index: 36;
     }
+    .voice-button:not([data-voice-hint])::before,
+    .voice-button:not([data-voice-hint])::after {
+      display: none;
+    }
+    .site-header .voice-button {
+      grid-column: auto;
+      grid-row: auto;
+      height: 24px;
+      width: 24px;
+    }
+    .site-header .voice-button::after {
+      left: 0;
+      transform: translateY(-2px);
+    }
+    .voice-button.loading,
     .voice-button.transcribing {
-      animation: search-phase-pulse 620ms linear infinite;
+      color: #0057ff;
+    }
+    .voice-button.ready,
+    .voice-button.recording {
+      color: #137333;
+    }
+    .voice-button:hover::before,
+    .voice-button:hover::after,
+    .voice-button:focus-visible::before,
+    .voice-button:focus-visible::after {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+    .site-header .voice-button:hover::after,
+    .site-header .voice-button:focus-visible::after {
+      transform: translateY(0);
     }
     .voice-button.error {
-      color: #b00020;
+      color: #777;
     }
     .voice-menu {
       background: #fff;
@@ -573,8 +725,201 @@ export const pageStyles = `    * { box-sizing: border-box; }
       color: #555;
       font-size: 12px;
     }
-    .entry-form:has(.slash-args:not([hidden])) .voice-button,
-    #terminal-form:has(.slash-args:not([hidden])) .voice-button {
+    .format-indicator {
+      color: #111;
+      cursor: pointer;
+      display: inline-grid;
+      grid-column: 3;
+      grid-row: 1;
+      height: 24px;
+      place-items: center;
+      width: 18px;
+    }
+    .format-indicator:hover,
+    .format-indicator:focus-visible {
+      background: #f2f2f2;
+      outline: 1px solid #111;
+    }
+    .format-icon {
+      color: #111;
+      display: block;
+      height: 16px;
+      position: relative;
+      width: 16px;
+    }
+    .format-icon-list,
+    .format-icon-string {
+      align-content: center;
+      display: grid;
+      gap: 3px;
+    }
+    .format-icon-list span,
+    .format-icon-string span {
+      background: #111;
+      display: block;
+      height: 1px;
+    }
+    .format-icon-list span:nth-child(1) { width: 14px; }
+    .format-icon-list span:nth-child(2) { width: 11px; }
+    .format-icon-list span:nth-child(3) { width: 13px; }
+    .format-icon-string span {
+      width: 13px;
+    }
+    .format-icon-string::before,
+    .format-icon-string::after {
+      content: "";
+      position: absolute;
+      top: 5px;
+      width: 2px;
+      height: 4px;
+      border-top: 1px solid #111;
+    }
+    .format-icon-string::before {
+      left: 0;
+      border-left: 1px solid #111;
+    }
+    .format-icon-string::after {
+      right: 0;
+      border-right: 1px solid #111;
+    }
+    .format-icon-boolean {
+      border: 1px solid #111;
+      height: 12px;
+      margin: 2px;
+      width: 12px;
+    }
+    .format-icon-boolean::after {
+      border-bottom: 1px solid #111;
+      border-right: 1px solid #111;
+      content: "";
+      height: 7px;
+      left: 4px;
+      position: absolute;
+      top: 0;
+      transform: rotate(38deg);
+      width: 4px;
+    }
+    .format-icon-url::before,
+    .format-icon-url::after {
+      border: 1px solid #111;
+      border-radius: 8px;
+      content: "";
+      height: 7px;
+      position: absolute;
+      top: 4px;
+      width: 9px;
+    }
+    .format-icon-url::before {
+      left: 1px;
+      transform: rotate(-28deg);
+    }
+    .format-icon-url::after {
+      right: 1px;
+      transform: rotate(-28deg);
+    }
+    .format-icon-restaurant {
+      border: 1px solid #111;
+      height: 13px;
+      margin: 1px;
+      width: 14px;
+    }
+    .format-icon-restaurant::before {
+      background: #111;
+      content: "";
+      height: 1px;
+      left: 2px;
+      position: absolute;
+      top: 4px;
+      width: 10px;
+    }
+    .format-icon-restaurant::after {
+      background: #111;
+      content: "";
+      height: 3px;
+      left: 2px;
+      position: absolute;
+      top: 8px;
+      width: 3px;
+    }
+    .format-icon-restaurant-list span {
+      border: 1px solid #111;
+      display: block;
+      height: 4px;
+      margin-bottom: 2px;
+      width: 14px;
+    }
+    .format-icon-json {
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 16px;
+      text-align: center;
+    }
+    .format-menu {
+      background: #fff;
+      border: 1px solid #111;
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
+      display: flex;
+      flex-direction: column;
+      max-width: min(420px, calc(100vw - 16px));
+      min-width: 320px;
+      padding: 4px;
+      position: fixed;
+      z-index: 20;
+    }
+    .format-menu-search {
+      background: #fff;
+      border: 0;
+      border-bottom: 1px solid #ddd;
+      color: #111;
+      font: inherit;
+      font-size: 13px;
+      margin-bottom: 4px;
+      outline: none;
+      padding: 6px 8px;
+      width: 100%;
+    }
+    .format-menu-options {
+      display: flex;
+      flex-direction: column;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+    .format-menu-option {
+      appearance: none;
+      background: #fff;
+      border: 0;
+      color: #111;
+      column-gap: 8px;
+      cursor: pointer;
+      display: grid;
+      grid-template-columns: 20px minmax(0, 1fr);
+      min-height: 34px;
+      padding: 6px 8px;
+      text-align: left;
+    }
+    .format-menu-option:hover,
+    .format-menu-option.active {
+      background: #f2f2f2;
+    }
+    .format-menu-icon {
+      align-self: center;
+      display: inline-grid;
+      grid-row: 1 / span 2;
+      place-items: center;
+    }
+    .format-menu-name {
+      font-size: 13px;
+      line-height: 1.25;
+    }
+    .format-menu-detail {
+      color: #444;
+      font-size: 12px;
+      grid-column: 2;
+      line-height: 1.25;
+      min-width: 0;
+    }
+    .entry-form:has(.slash-args:not([hidden])) .format-indicator,
+    #terminal-form:has(.slash-args:not([hidden])) .format-indicator {
       grid-column: 5;
     }
     .entry-form:has(.slash-args:not([hidden])) .input-shell,
@@ -602,14 +947,13 @@ export const pageStyles = `    * { box-sizing: border-box; }
       width: 100%;
       z-index: 2;
     }
-    .entry.command-highlight-active .entry-input,
-    .current-command.command-highlight-active textarea {
+    .input-shell.command-highlight-active .entry-input,
+    .input-shell.command-highlight-active textarea {
       color: transparent;
       caret-color: #111;
       text-shadow: none;
     }
-    .entry.command-highlight-active .inline-inference-highlight,
-    .current-command.command-highlight-active .inline-inference-highlight {
+    .input-shell.command-highlight-active .inline-inference-highlight {
       display: block;
     }
     .inline-inference-glow {
@@ -1014,6 +1358,100 @@ export const pageStyles = `    * { box-sizing: border-box; }
       padding: 8px;
       white-space: pre;
     }
+    .implicit-result {
+      margin-top: 6px;
+    }
+    .implicit-result-body .slash-json {
+      font-size: 12px;
+    }
+    .implicit-pill {
+      align-items: baseline;
+      background: #f0f4ff;
+      border: 1px solid #c3d2ff;
+      border-radius: 4px;
+      cursor: pointer;
+      display: inline-flex;
+      font: inherit;
+      font-size: 13px;
+      gap: 6px;
+      padding: 4px 8px;
+    }
+    .implicit-pill:hover {
+      background: #e3ebff;
+    }
+    .implicit-pill-cmd {
+      color: #3355cc;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .stock-card {
+      display: grid;
+      gap: 8px;
+      font-size: 15px;
+      line-height: 1.35;
+    }
+    .stock-topline {
+      align-items: center;
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(120px, max-content) minmax(132px, 164px);
+    }
+    .stock-symbol {
+      color: #555;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0;
+    }
+    .stock-price {
+      color: #111;
+      font-size: 30px;
+      line-height: 1.05;
+      white-space: nowrap;
+    }
+    .stock-meta {
+      align-items: baseline;
+      color: #777;
+      display: flex;
+      flex-wrap: wrap;
+      font-size: 12px;
+      gap: 6px 12px;
+    }
+    .stock-meta a {
+      color: inherit;
+      text-decoration: underline;
+    }
+    .stock-change {
+      color: #666;
+      font-variant-numeric: tabular-nums;
+    }
+    .stock-up .stock-change {
+      color: #137333;
+    }
+    .stock-down .stock-change {
+      color: #b3261e;
+    }
+    .stock-sparkline {
+      display: block;
+      height: 42px;
+      overflow: visible;
+      width: 164px;
+    }
+    .stock-sparkline polyline {
+      fill: none;
+      stroke: #777;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 2;
+    }
+    .stock-sparkline-up polyline {
+      stroke: #137333;
+    }
+    .stock-sparkline-down polyline {
+      stroke: #b3261e;
+    }
+    .stock-sparkline-empty {
+      border-bottom: 1px solid #d8d8d8;
+    }
     .weather-card {
       display: grid;
       gap: 10px;
@@ -1095,11 +1533,43 @@ export const pageStyles = `    * { box-sizing: border-box; }
       margin: 0;
       padding: 0;
     }
+    .lanes-open-list {
+      display: grid;
+      gap: 8px;
+    }
+    .lanes-open-day {
+      display: grid;
+      grid-template-columns: minmax(96px, auto) 1fr;
+      gap: 12px;
+    }
+    .lanes-open-date {
+      color: #111;
+    }
+    .lanes-open-times {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+    }
+    .lanes-open-time {
+      color: #111;
+      white-space: nowrap;
+    }
+    .lanes-open-time span {
+      color: #777;
+      font-size: 12px;
+      padding-left: 3px;
+    }
+    .lanes-none {
+      color: #777;
+    }
     .lanes-row {
       display: grid;
       grid-template-columns: minmax(96px, auto) minmax(120px, auto) auto 1fr;
       gap: 12px;
       margin: 0;
+    }
+    .lanes-row-compact {
+      grid-template-columns: minmax(120px, auto) auto 1fr;
     }
     .lanes-day {
       color: #111;
@@ -1220,8 +1690,12 @@ export const pageStyles = `    * { box-sizing: border-box; }
       }
       .weather-metrics,
       .weather-day,
+      .stock-topline,
       .restaurant-card {
         grid-template-columns: 1fr;
+      }
+      .stock-sparkline {
+        max-width: 100%;
       }
     }
 `;

@@ -8,6 +8,7 @@ import type {
   SlashCommandResponse,
   TriggerQualification
 } from "../models";
+import { DEFAULT_INSTALL_CONFIG, type InstallConfig } from "./install";
 
 export interface SlashCommandContext {
   request: {
@@ -16,6 +17,21 @@ export interface SlashCommandContext {
     args: Record<string, unknown>;
   };
   startedAt: number;
+}
+
+// Result of an *implicit* (no leading slash) detection: the command recognised
+// the raw input as something it can handle — a math formula, a "1 cup in qt"
+// phrase, a ticker symbol — without the user typing `/command`.
+export interface ImplicitMatch<TArgs extends Record<string, unknown> = Record<string, unknown>> {
+  // 0..1 — how sure the command is that this input is meant for it. Used to pick
+  // a winner when several commands match and to gate against the configured
+  // minConfidence threshold.
+  confidence: number;
+  // Parsed arguments, ready to hand straight to executeCommand — no re-parse.
+  args: TArgs;
+  // A short, human-readable label for the match (e.g. the normalised expression
+  // or the resolved "1 cup → qt"). Optional; the renderer may show it.
+  label?: string;
 }
 
 export abstract class SlashCommand<TArgs extends Record<string, unknown>, TOutput> {
@@ -33,9 +49,26 @@ export abstract class SlashCommand<TArgs extends Record<string, unknown>, TOutpu
 
   protected readonly triggerPatterns: RegExp[] = [];
 
+  // Default install config for this command. Subclasses override to opt into
+  // implicit pickup and choose its render mode; deployments layer further
+  // overrides via resolveInstallConfig (see ./install.ts).
+  readonly installDefaults: InstallConfig = DEFAULT_INSTALL_CONFIG;
+
   enabled() {
     return true;
   }
+
+  // Optional: implicit (no-slash) detection. Return a match when the raw input
+  // — without a leading `/command` — should be handled by this command, e.g.
+  // a bare math formula for /calc or a ticker symbol for /stock. Return
+  // undefined when the input isn't ours. Must be pure + synchronous so the
+  // client can run every command's detector on each keystroke with no network.
+  detectImplicit?(query: string): ImplicitMatch<TArgs> | undefined;
+
+  // Optional: autocomplete a partial implicit input to a fuller form, e.g.
+  // "35 f i" -> "35 f in c". Return the completed string (the full input,
+  // not just the suffix) or undefined when there's nothing to complete.
+  completeImplicit?(query: string): string | undefined;
 
   describe(): SlashCommandDescriptor {
     return {
@@ -109,6 +142,14 @@ export abstract class LanesSlashCommand<TArgs extends Record<string, unknown>, T
   readonly placement: SlashCommandPlacement = {
     target: "results",
     renderer: "lanes-card"
+  } as const;
+}
+
+export abstract class StockSlashCommand<TArgs extends Record<string, unknown>, TOutput>
+  extends LookupSlashCommand<TArgs, TOutput> {
+  readonly placement: SlashCommandPlacement = {
+    target: "results",
+    renderer: "stock-card"
   } as const;
 }
 

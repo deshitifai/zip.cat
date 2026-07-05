@@ -1,11 +1,11 @@
 import type { EffortLevel } from "../models";
 import {
   ExaAutoWebSearchGenerator,
+  ExaDeepWebSearchGenerator,
   ExaDeepLiteWebSearchGenerator,
   ExaFastWebSearchGenerator,
   ExaInstantWebSearchGenerator
 } from "./exa";
-import { SerpApiGoogleWebSearchGenerator } from "./serpApi";
 
 export function createWebSearchGenerators() {
   return [
@@ -13,7 +13,7 @@ export function createWebSearchGenerators() {
     new ExaFastWebSearchGenerator(),
     new ExaAutoWebSearchGenerator(),
     new ExaDeepLiteWebSearchGenerator(),
-    new SerpApiGoogleWebSearchGenerator()
+    new ExaDeepWebSearchGenerator()
   ];
 }
 

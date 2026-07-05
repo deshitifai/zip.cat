@@ -123,6 +123,23 @@ Output rules:
 - Do not include markdown, prose, code fences, comments, or explanation.`;
   }
 
+  if (descriptor.renderer === "url") {
+    return `Output format requested by the user:
+First solve the user's request exactly as you would if no output format had been requested. The format must not change the destination you choose. Then encode only the best destination URL as a single JSON string.
+
+URL rules:
+- Return the canonical page that best satisfies the user's request.
+- Prefer a direct article, product, venue, documentation, profile, or official page over a search-results page or homepage.
+- The URL must be absolute and use http:// or https://.
+- Do not return tracking redirects, JavaScript URLs, mailto links, or relative URLs.
+
+Output rules:
+- Return exactly one JSON string and nothing else.
+- Correct example: "https://example.com/path"
+- Incorrect examples: {"url":"https://example.com/path"}, https://example.com/path, [https://example.com/path](https://example.com/path)
+- Do not include markdown, prose, code fences, comments, or explanation.`;
+  }
+
   if (descriptor.renderer === "restaurant-card" || descriptor.renderer === "restaurant-list") {
     return `Output format requested by the user:
 First solve the user's request exactly as you would if no output format had been requested. The format must not change which restaurant/place entity or entities you choose.
@@ -179,6 +196,20 @@ function parseTypedOutputJson(text: string, descriptor: TypedOutputDescriptor) {
         }
       }
       throw new Error(`AI response did not return a boolean for ${descriptor.marker}.`);
+    }
+    if (descriptor.renderer === "url") {
+      if (typeof parsed === "string" && /^https?:\/\//i.test(parsed.trim())) {
+        return parsed.trim();
+      }
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const record = parsed as Record<string, unknown>;
+        for (const key of ["url", "href", "link"]) {
+          if (typeof record[key] === "string" && /^https?:\/\//i.test(record[key].trim())) {
+            return record[key].trim();
+          }
+        }
+      }
+      throw new Error(`AI response did not return an absolute http(s) URL for ${descriptor.marker}.`);
     }
     return parsed;
   } catch {
@@ -308,7 +339,13 @@ export async function answer(request: AiRequest): Promise<AiResponse> {
     : undefined;
   const result = await generator.execute({
     prompt: modelPrompt,
-    messages: modelMessages
+    messages: modelMessages,
+    responseSchema: requestedTypedOutput
+      ? {
+        name: requestedTypedOutput.name,
+        schema: requestedTypedOutput.schema
+      }
+      : undefined
   });
   const typedValue = requestedTypedOutput
     ? parseTypedOutputJson(result.text, requestedTypedOutput)
@@ -355,7 +392,11 @@ export async function shapeSearchResults(request: SearchShapeRequest): Promise<S
     pageEvidence
   });
   const result = await generator.execute({
-    prompt: modelPrompt
+    prompt: modelPrompt,
+    responseSchema: {
+      name: descriptor.name,
+      schema: descriptor.schema
+    }
   });
   const typedValue = parseTypedOutputJson(result.text, descriptor);
 

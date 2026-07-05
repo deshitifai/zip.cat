@@ -1,4 +1,5 @@
 import type { AiChatMessage, EffortLevel } from "../models";
+import { envVar } from "../runtimeEnv";
 import {
   AiGenerator,
   type AiGenerateRequest,
@@ -64,7 +65,7 @@ export abstract class OpenRouterAiGenerator extends GenericAiGenerator {
   protected abstract readonly configuredModel: string;
 
   enabled() {
-    return Boolean(process.env.OPENROUTER_API_KEY);
+    return Boolean(envVar("OPENROUTER_API_KEY"));
   }
 
   describe(): GeneratorDescriptor {
@@ -82,7 +83,7 @@ export abstract class OpenRouterAiGenerator extends GenericAiGenerator {
   }
 
   async execute(request: AiGenerateRequest): Promise<AiGenerationResult> {
-    const apiKey = process.env.OPENROUTER_API_KEY;
+    const apiKey = envVar("OPENROUTER_API_KEY");
     if (!apiKey) {
       throw new Error("OPENROUTER_API_KEY is not configured.");
     }
@@ -199,8 +200,8 @@ export class OpenRouterGpt41NanoGenerator extends OpenRouterAiGenerator {
   readonly id = "openrouter.ai.gpt-4.1-nano";
   readonly name = "OpenRouter GPT-4.1 Nano";
   readonly effort = 1;
-  protected readonly configuredModel = process.env.AI_MODEL_EFFORT_1
-    ?? process.env.OPENROUTER_MODEL_EFFORT_1
+  protected readonly configuredModel = envVar("AI_MODEL_EFFORT_1")
+    ?? envVar("OPENROUTER_MODEL_EFFORT_1")
     ?? "openai/gpt-4.1-nano";
 }
 
@@ -208,8 +209,8 @@ export class OpenRouterGpt41MiniGenerator extends OpenRouterAiGenerator {
   readonly id = "openrouter.ai.gpt-4.1-mini";
   readonly name = "OpenRouter GPT-4.1 Mini";
   readonly effort = 2;
-  protected readonly configuredModel = process.env.AI_MODEL_EFFORT_2
-    ?? process.env.OPENROUTER_MODEL_EFFORT_2
+  protected readonly configuredModel = envVar("AI_MODEL_EFFORT_2")
+    ?? envVar("OPENROUTER_MODEL_EFFORT_2")
     ?? "openai/gpt-4.1-mini";
 }
 
@@ -217,9 +218,9 @@ export class OpenRouterAutoGenerator extends OpenRouterAiGenerator {
   readonly id = "openrouter.ai.auto";
   readonly name = "OpenRouter Auto";
   readonly effort = 3;
-  protected readonly configuredModel = process.env.AI_MODEL_EFFORT_3
-    ?? process.env.OPENROUTER_MODEL_EFFORT_3
-    ?? process.env.AI_MODEL
+  protected readonly configuredModel = envVar("AI_MODEL_EFFORT_3")
+    ?? envVar("OPENROUTER_MODEL_EFFORT_3")
+    ?? envVar("AI_MODEL")
     ?? "openrouter/auto";
 }
 
@@ -227,8 +228,8 @@ export class OpenRouterGpt41Generator extends OpenRouterAiGenerator {
   readonly id = "openrouter.ai.gpt-4.1";
   readonly name = "OpenRouter GPT-4.1";
   readonly effort = 4;
-  protected readonly configuredModel = process.env.AI_MODEL_EFFORT_4
-    ?? process.env.OPENROUTER_MODEL_EFFORT_4
+  protected readonly configuredModel = envVar("AI_MODEL_EFFORT_4")
+    ?? envVar("OPENROUTER_MODEL_EFFORT_4")
     ?? "openai/gpt-4.1";
 }
 
@@ -236,8 +237,8 @@ export class OpenRouterGpt41HighGenerator extends OpenRouterAiGenerator {
   readonly id = "openrouter.ai.gpt-4.1-high";
   readonly name = "OpenRouter GPT-4.1 High";
   readonly effort = 5;
-  protected readonly configuredModel = process.env.AI_MODEL_EFFORT_5
-    ?? process.env.OPENROUTER_MODEL_EFFORT_5
+  protected readonly configuredModel = envVar("AI_MODEL_EFFORT_5")
+    ?? envVar("OPENROUTER_MODEL_EFFORT_5")
     ?? "openai/gpt-4.1";
 }
 

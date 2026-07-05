@@ -2,11 +2,78 @@ import { marked } from "marked";
 import { wikipediaTitlePlugin } from "./plugins/wikipediaTitle";
 import { wiktionaryHeadwordPlugin } from "./plugins/wiktionaryHeadword";
 import { suggest as runLocalSuggest } from "./suggest";
-import { runSlashCommand as executeStaticSlashCommand, slashCommandDescriptors } from "./slash/registry";
+import {
+  runSlashCommand as executeStaticSlashCommand,
+  slashCommandDescriptors,
+  detectImplicitCommand,
+  completeImplicitInput
+} from "./slash/registry";
+import { createSlashContext } from "./slash/base";
 import { typedOutputDescriptors } from "./typedOutputs";
+import {
+  defaultResultFormat,
+  type ResultFormatKind,
+  resultFormatForQuery,
+  resultFormatForTypedOutput,
+  resultFormatIconMarkup,
+  resultFormatIndicatorMarkup
+} from "./resultFormat";
 import { type CacheHit, formatAge, readCache, writeCache } from "./cache";
+import { DEFAULT_LOCALE, isLocale, translate, type Locale, type MessageKey } from "./i18n";
 
 declare const __ZIP_CAT_STATIC_BUILD__: boolean | undefined;
+
+// Active UI locale, derived from ?lang= and kept in sync with the header
+// dropdown via the `zip:i18n` event the inline render script dispatches. Every
+// client-generated label goes through `t()` so it follows the selected language.
+let currentLocale: Locale = (() => {
+  try {
+    const lang = new URLSearchParams(location.search).get("lang");
+    return isLocale(lang) ? lang : DEFAULT_LOCALE;
+  } catch {
+    return DEFAULT_LOCALE;
+  }
+})();
+
+function t(key: MessageKey, params?: Record<string, string | number>) {
+  return translate(currentLocale, key, params);
+}
+
+function localizedRunState(state: "idle" | "active" | "done" | "error") {
+  switch (state) {
+    case "active": return t("statusActive");
+    case "done": return t("statusDone");
+    case "error": return t("statusError");
+    default: return t("statusIdle");
+  }
+}
+
+// Re-localize labels that were built dynamically (so they carry no data-i18n
+// attribute the inline applyI18n could re-run). Static markup is handled by the
+// attribute-driven applyI18n; this covers effort bars, voice hints, and run-status marks.
+function relocalizeDynamicLabels() {
+  try {
+    refreshEffortTitles();
+    refreshVoiceButtonLabels();
+    document.querySelectorAll<HTMLElement>(".run-status-mark[data-status-kind]").forEach((mark) => {
+      // Only the idle marks have a stable label; busy marks update on next tick.
+      if (!mark.classList.contains("active") && !mark.classList.contains("done") && !mark.classList.contains("error")) {
+        const kind = mark.dataset.statusKind === "ai" ? t("aiLabel") : t("searchLabel");
+        mark.setAttribute("aria-label", `${kind} ${t("statusIdle")}`);
+      }
+    });
+  } catch {
+    // Defensive: a relocalize must never break the page.
+  }
+}
+
+document.addEventListener("zip:i18n", (event) => {
+  const detail = (event as CustomEvent<{ locale?: string }>).detail;
+  if (detail && isLocale(detail.locale)) {
+    currentLocale = detail.locale;
+    relocalizeDynamicLabels();
+  }
+});
 
 type SearchResult = {
   title?: string;
@@ -84,6 +151,48 @@ type VoiceTranscriptionResponse = {
 };
 
 type CommandMode = "search" | "ai";
+
+// The prompt glyph at the start of the command line is a real, ordered registry
+// of modes. Clicking the glyph (or arrow-cycling) advances to the next entry,
+// wrapping around. Adding a future mode is just another array element — every
+// glyph lookup, aria label, and cycle step flows from here, so no per-mode
+// branching is hardcoded elsewhere.
+interface PromptMode {
+  mode: CommandMode;
+  // The character shown as the prompt (">" for search, "*" for AI, ...).
+  glyph: string;
+  // i18n key for the live (main) input's aria-label in this mode.
+  ariaKey: MessageKey;
+  // i18n key for a previous-search/cloned input's aria-label in this mode.
+  previousAriaKey: MessageKey;
+}
+
+const PROMPT_MODES: PromptMode[] = [
+  { mode: "search", glyph: ">", ariaKey: "searchAria", previousAriaKey: "previousSearch" },
+  { mode: "ai", glyph: "*", ariaKey: "aiPrompt", previousAriaKey: "aiPrompt" }
+];
+
+function promptModeFor(mode: CommandMode): PromptMode {
+  return PROMPT_MODES.find((entry) => entry.mode === mode) ?? PROMPT_MODES[0]!;
+}
+
+function promptGlyphFor(mode: CommandMode): string {
+  return promptModeFor(mode).glyph;
+}
+
+// The next mode in the registry, wrapping back to the first after the last.
+function nextCommandMode(mode: CommandMode): CommandMode {
+  const index = PROMPT_MODES.findIndex((entry) => entry.mode === mode);
+  const next = PROMPT_MODES[(index + 1) % PROMPT_MODES.length]!;
+  return next.mode;
+}
+
+// Read the mode off an element's data-mode, defaulting to the first registry
+// entry for any unknown/missing value.
+function modeFromDataset(value: string | undefined): CommandMode {
+  return PROMPT_MODES.find((entry) => entry.mode === value)?.mode ?? PROMPT_MODES[0]!.mode;
+}
+
 type CommandField = HTMLInputElement | HTMLTextAreaElement;
 type EffortLevel = 1 | 2 | 3 | 4 | 5;
 type VoiceEngine = "server" | "browser";
@@ -92,6 +201,11 @@ type EffortContext = {
   bars: HTMLElement;
   entry?: HTMLElement;
   effort: EffortLevel;
+  mode: CommandMode;
+};
+type FormatMenuContext = {
+  field: CommandField;
+  form: HTMLElement;
   mode: CommandMode;
 };
 type AiThreadTurn = {
@@ -152,7 +266,7 @@ type SlashCommandDescriptor = {
   arguments: SlashCommandArgument[];
   placement: {
     target: "results";
-    renderer: "weather-card" | "lanes-card" | "json";
+    renderer: "weather-card" | "lanes-card" | "stock-card" | "json";
   };
   outputSchema: Record<string, unknown>;
   cache?: { ttlMs: number };
@@ -165,7 +279,7 @@ type SlashCommandResponse = {
   args: Record<string, unknown>;
   placement: {
     target: "results";
-    renderer: "weather-card" | "lanes-card" | "json";
+    renderer: "weather-card" | "lanes-card" | "stock-card" | "json";
   };
   schema: Record<string, unknown>;
   output: unknown;
@@ -173,7 +287,7 @@ type SlashCommandResponse = {
   debug?: Record<string, unknown>;
   error?: string;
 };
-type TypedOutputRenderer = "markdown" | "boolean" | "restaurant-card" | "restaurant-list" | "json";
+type TypedOutputRenderer = "markdown" | "boolean" | "url" | "restaurant-card" | "restaurant-list" | "json";
 type TypedOutputDescriptor = {
   id: string;
   marker: `#${string}`;
@@ -209,9 +323,13 @@ type CommandSelection = {
   end: number;
   direction: "forward" | "backward" | "none";
 };
+type LuckySubmit = {
+  target: Window | null;
+};
 
 const shortcutLabels = "123456789abcdefghijklmnopqrstuvwxyz".split("");
 const allEffortLevels = [1, 2, 3, 4, 5] as EffortLevel[];
+const mobileSearchResultLimit = 6;
 const staticBuild = typeof __ZIP_CAT_STATIC_BUILD__ !== "undefined" && __ZIP_CAT_STATIC_BUILD__;
 const staticMode = staticBuild ||
   document.documentElement.dataset.zipStatic === "true" ||
@@ -260,6 +378,9 @@ let browserMoonshineStatus: "idle" | "loading" | "ready" | "error" = "idle";
 let browserMoonshineStatusMessage = "";
 let browserMoonshineActiveHandler: ((payload: BrowserMoonshineMessage) => void) | undefined;
 let threadIdCounter = 0;
+let lastVoiceInput: CommandField | undefined;
+let pendingVoiceStart: Promise<void> | undefined;
+const luckySubmits = new WeakMap<HTMLFormElement, LuckySubmit>();
 
 function escapeHtml(value: string) {
   return value
@@ -341,6 +462,21 @@ function typedOutputForMarker(marker: string) {
   return typedOutputs.find((descriptor) => descriptor.marker.toLowerCase() === normalized.toLowerCase());
 }
 
+function urlTypedOutputDescriptor() {
+  return typedOutputForMarker("#url") ?? {
+    id: "url",
+    marker: "#url" as const,
+    name: "url",
+    label: "URL",
+    description: "A single best destination URL.",
+    renderer: "url" as const,
+    schema: {
+      type: "string",
+      format: "uri"
+    }
+  };
+}
+
 function typedOutputReferences(query: string) {
   const refs: Array<{ descriptor: TypedOutputDescriptor; marker: string; start: number; end: number }> = [];
   for (const match of query.matchAll(/#([A-Za-z][A-Za-z0-9_]*)(\s*\[\])?/g)) {
@@ -363,6 +499,59 @@ function stripTypedOutputMarkers(query: string) {
   return query.replace(/#([A-Za-z][A-Za-z0-9_]*)(\s*\[\])?/g, (value) => (
     typedOutputForMarker(value) ? "" : value
   )).replace(/\s{2,}/g, " ").trim();
+}
+
+function typedOutputFormatAppendix(descriptor: TypedOutputDescriptor) {
+  if (descriptor.renderer === "url") {
+    return `Output format requested by the user:
+First solve the user's request exactly as you would if no output format had been requested. The format must not change the destination you choose. Then encode only the best destination URL as a single JSON string.
+
+URL rules:
+- Return the canonical page that best satisfies the user's request.
+- Prefer a direct article, product, venue, documentation, profile, or official page over a search-results page or homepage.
+- The URL must be absolute and use http:// or https://.
+- Do not return tracking redirects, JavaScript URLs, mailto links, or relative URLs.
+
+Output rules:
+- Return exactly one JSON string and nothing else.
+- Correct example: "https://example.com/path"
+- Incorrect examples: {"url":"https://example.com/path"}, https://example.com/path, [https://example.com/path](https://example.com/path)
+- Do not include markdown, prose, code fences, comments, or explanation.`;
+  }
+
+  return `Output format requested by the user:
+First solve the user's request exactly as you would if no output format had been requested. The format must not change the answer you choose. Then encode only that final answer as JSON matching ${descriptor.marker}.
+
+Output rules:
+- Return exactly one JSON value and nothing else.
+- Do not include markdown, prose, code fences, comments, or explanation outside the JSON value.
+- The JSON value must validate against the requested type.`;
+}
+
+function typedOutputInstruction(descriptor: TypedOutputDescriptor, prompt: string) {
+  return `${prompt}
+
+${typedOutputFormatAppendix(descriptor)}`;
+}
+
+function typedOutputMessages(descriptor: TypedOutputDescriptor, messages: AiChatMessage[]) {
+  const nextMessages = messages.map((message) => ({ ...message }));
+  for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
+    if (nextMessages[index].role === "user") {
+      nextMessages[index].content = typedOutputInstruction(
+        descriptor,
+        stripTypedOutputMarkers(nextMessages[index].content)
+      );
+      return nextMessages;
+    }
+  }
+  return [
+    ...nextMessages,
+    {
+      role: "user" as const,
+      content: typedOutputFormatAppendix(descriptor)
+    }
+  ];
 }
 
 function typedOutputGhostMatch(query: string) {
@@ -420,26 +609,48 @@ function commandHighlightHtml(query: string, inlineActive = false, ghostText = "
 
 function updateCommandHighlight(searchInput: CommandField, inlineActive = false) {
   const block = searchInput.closest<HTMLElement>(".entry, .current-command");
-  const highlight = block?.querySelector<HTMLElement>(".inline-inference-highlight");
-  if (!block || !highlight) {
+  const inputShell = searchInput.closest<HTMLElement>(".input-shell");
+  const highlight = inputShell?.querySelector<HTMLElement>(".inline-inference-highlight");
+  if (!block || !inputShell || !highlight) {
     return;
   }
 
   const hasValidWindowRef = commandWindowReferences(searchInput.value)
     .some((reference) => Boolean(commandBlockForIndex(reference.index)));
   const hasInlineGlow = inlineActive && inlineInferenceSpans(searchInput.value).length > 0;
-  const mode: CommandMode = block.dataset.mode === "ai" ? "ai" : "search";
+  const mode: CommandMode = modeFromDataset(block.dataset.mode);
+  updateResultFormatIndicator(searchInput, mode);
   const typedGhostText = typedOutputGhostText(searchInput.value);
-  const ghostText = typedGhostText || (mode === "search" ? slashCommandGhostText(searchInput.value) : "");
+  const ghostText = typedGhostText
+    || (mode === "search" ? slashCommandGhostText(searchInput.value) : "")
+    || (mode === "search" ? implicitGhostText(searchInput.value) : "");
   const hasTypedOutputRef = typedOutputReferences(searchInput.value).length > 0;
   if (!hasValidWindowRef && !hasInlineGlow && !ghostText && !hasTypedOutputRef) {
     block.classList.remove("command-highlight-active");
+    inputShell.classList.remove("command-highlight-active");
     highlight.replaceChildren();
     return;
   }
 
   highlight.innerHTML = commandHighlightHtml(searchInput.value, inlineActive, ghostText);
-  block.classList.add("command-highlight-active");
+  block.classList.remove("command-highlight-active");
+  inputShell.classList.add("command-highlight-active");
+}
+
+function updateResultFormatIndicator(searchInput: CommandField, mode: CommandMode = "search") {
+  const indicator = searchInput
+    .closest<HTMLFormElement>("form")
+    ?.querySelector<HTMLElement>(".format-indicator");
+  if (!indicator) {
+    return;
+  }
+
+  const wrapper = document.createElement("span");
+  wrapper.innerHTML = resultFormatIndicatorMarkup(resultFormatForQuery(searchInput.value, mode, typedOutputs));
+  const nextIndicator = wrapper.firstElementChild;
+  if (nextIndicator) {
+    indicator.replaceWith(nextIndicator);
+  }
 }
 
 function effortBarsMarkup(effort: EffortLevel, mode: CommandMode = "search") {
@@ -456,16 +667,25 @@ function effortBarsMarkup(effort: EffortLevel, mode: CommandMode = "search") {
         isAvailable && level <= configuredEffort ? "active" : "",
         isAvailable ? "" : "unavailable"
       ].filter(Boolean).join(" ");
-      const title = isAvailable ? effortDescription(mode, level) : `Level ${level} is not configured`;
+      const title = isAvailable ? effortDescription(mode, level) : t("effortLevelUnconfigured", { level });
       return `<span class="${classes}" data-effort-level="${level}" title="${escapeHtml(title)}" aria-hidden="true"></span>`;
+    })
+    .join("")}</span>`;
+}
+
+function effortMenuBarsMarkup(mode: CommandMode, effort: EffortLevel) {
+  return `<span class="effort-menu-bars" aria-label="${escapeHtml(effortAriaLabel(mode, effort))}">${allEffortLevels
+    .map((level) => {
+      const classes = ["effort-bar", level <= effort ? "active" : ""].filter(Boolean).join(" ");
+      return `<span class="${classes}" aria-hidden="true"></span>`;
     })
     .join("")}</span>`;
 }
 
 function runStatusMarkup() {
   return `<span class="run-status" aria-live="polite">
-    <span class="run-status-mark" data-status-kind="ai" aria-label="AI idle">*</span>
-    <span class="run-status-mark" data-status-kind="search" aria-label="Search idle">&gt;</span>
+    <span class="run-status-mark" data-status-kind="ai" aria-label="${escapeHtml(t("aiIdle"))}">*</span>
+    <span class="run-status-mark" data-status-kind="search" aria-label="${escapeHtml(t("searchIdle"))}">&gt;</span>
   </span>`;
 }
 
@@ -485,7 +705,7 @@ function turnMarkup(prompt = "") {
         <textarea class="entry-input thread-followup-input" aria-label="Message" name="q" rows="1">${escapeHtml(prompt)}</textarea>
         <span class="inline-inference-highlight" aria-hidden="true"></span>
       </span>
-      <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+      ${resultFormatIndicatorMarkup(resultFormatForQuery(prompt, "ai", typedOutputs))}
       <div class="slash-args" hidden></div>
     </form>
     <div class="ai-turn-body"></div>
@@ -545,7 +765,7 @@ function renderEntry(
   effort: EffortLevel = 3,
   slashArgValues: Record<string, unknown> = {}
 ) {
-  const prompt = mode === "ai" ? "*" : "&gt;";
+  const prompt = escapeHtml(promptGlyphFor(mode));
   const slashCommand = slashCommandForQuery(query);
   const slashValues = Object.keys(slashArgValues).length > 0
     ? slashArgValues
@@ -558,12 +778,12 @@ function renderEntry(
       ${runStatusMarkup()}
       ${effortBarsMarkup(effort, mode)}
       <form class="entry-form" action="/" method="get" autocomplete="off">
-        <span class="prompt" aria-hidden="true">${prompt}</span>
+        <span class="prompt prompt-toggle" aria-hidden="true" title="${escapeHtml(t("switchMode"))}" data-i18n-title="switchMode">${prompt}</span>
         <span class="input-shell">
-          <textarea class="entry-input" aria-label="Previous search" name="q" rows="1">${escapeHtml(displayQuery)}</textarea>
+          <textarea class="entry-input" aria-label="${escapeHtml(t("previousSearch"))}" data-i18n-aria="previousSearch" name="q" rows="1">${escapeHtml(displayQuery)}</textarea>
           <span class="inline-inference-highlight" aria-hidden="true"></span>
         </span>
-        <button class="voice-button" type="button" aria-label="Voice input" title="Voice input with Moonshine">●</button>
+        ${resultFormatIndicatorMarkup(resultFormatForQuery(displayQuery, mode, typedOutputs))}
         ${slashCommandControlsMarkup(slashCommand, slashValues)}
       </form>
       <div class="results">${content}</div>
@@ -577,6 +797,23 @@ function scrollToPrompt() {
   requestAnimationFrame(() => {
     window.scrollTo({
       top: document.documentElement.scrollHeight,
+      behavior: "smooth"
+    });
+  });
+}
+
+function isMobileViewport() {
+  return window.matchMedia("(max-width: 720px)").matches;
+}
+
+function defaultSearchResultLimit() {
+  return isMobileViewport() ? mobileSearchResultLimit : undefined;
+}
+
+function scrollToSubmittedEntry(row: Element) {
+  requestAnimationFrame(() => {
+    row.scrollIntoView({
+      block: "start",
       behavior: "smooth"
     });
   });
@@ -607,8 +844,10 @@ let slashCommands: SlashCommandDescriptor[] = [];
 let typedOutputs: TypedOutputDescriptor[] = [];
 let activeWindowReferenceTarget: HTMLElement | undefined;
 let effortMenuContext: EffortContext | undefined;
+let formatMenuContext: FormatMenuContext | undefined;
 let suggestSuppressedUntil = 0;
 const debugPayloads = new WeakMap<HTMLElement, DebugPayload>();
+const aiRunQueues = new WeakMap<HTMLElement, Promise<void>>();
 
 function normalizeEffortLevel(level: number) {
   return Math.min(Math.max(Math.round(level), 1), 5) as EffortLevel;
@@ -736,6 +975,42 @@ function acceptSlashCommandGhost(searchInput: CommandField) {
   slashControlsForInput(searchInput)
     ?.querySelector<HTMLInputElement>("[data-slash-arg]")
     ?.focus();
+  return true;
+}
+
+// Ghost suffix for an implicit (no-slash) autocomplete — e.g. typing "12 in "
+// shows a faded "in ft" the user can accept with Tab to get "12 in in ft".
+// Driven by the same static completeImplicitInput the eval library tests.
+function implicitCompletionFor(query: string): string | undefined {
+  if (!query.trim() || isSlashCommandInput(query)) {
+    return undefined;
+  }
+  const completed = completeImplicitInput(query);
+  if (!completed || !completed.startsWith(query)) {
+    return undefined;
+  }
+  return completed;
+}
+
+function implicitGhostText(query: string): string {
+  const completed = implicitCompletionFor(query);
+  if (!completed) {
+    return "";
+  }
+  const suffix = completed.slice(query.length);
+  return suffix || "";
+}
+
+function acceptImplicitGhost(searchInput: CommandField) {
+  const completed = implicitCompletionFor(searchInput.value);
+  if (!completed || completed === searchInput.value) {
+    return false;
+  }
+  searchInput.value = completed;
+  resizeCommandField(searchInput);
+  updateCommandHighlight(searchInput);
+  scheduleSuggest(searchInput);
+  updateImplicitResult(searchInput);
   return true;
 }
 
@@ -899,27 +1174,30 @@ function adjacentConfiguredEffortLevel(effort: EffortLevel, mode: CommandMode, d
 function effortAriaLabel(mode: CommandMode, effort: EffortLevel, levels = configuredEffortLevels(mode)) {
   const configuredEffort = closestConfiguredEffortLevel(effort, mode);
   if (levels.length === 1) {
-    return `${mode === "ai" ? "AI" : "Search"} generator ${configuredEffort}`;
+    return t("effortAriaGenerator", { mode: mode === "ai" ? t("aiLabel") : t("searchLabel"), level: configuredEffort });
   }
-  return `Effort ${configuredEffort} of 5`;
+  return t("effortAriaLevel", { level: configuredEffort });
 }
 
 function effortDescription(mode: CommandMode, effort: EffortLevel) {
+  // The "Effort N of 5" prefix is localized; generator names/api/pricing come
+  // from config and stay as-is (they're proper nouns / provider details).
+  const prefix = t("effortLevelPrefix", { level: effort });
   if (mode === "ai") {
     if (aiEngine === "browser-gemma") {
-      return "Local Gemma 4 WebGPU; runs 100% in this browser; downloads the model on first selection and caches it in site storage; $0 API cost";
+      return t("localGemmaDescription");
     }
 
     const generator = effortConfig?.ai.levels[String(effort)];
     return generator
-      ? `Effort ${effort} of 5: ${generator.name}; ${generator.api} via ${generator.provider}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
-      : `Effort ${effort} of 5: AI model level ${effort}`;
+      ? `${prefix}: ${generator.name}; ${generator.api} via ${generator.provider}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
+      : `${prefix}: ${t("aiLabel")} ${effort}`;
   }
 
   const generator = effortConfig?.search.levels[String(effort)];
   return generator
-    ? `Effort ${effort} of 5: ${generator.name}; ${generator.api}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
-    : `Effort ${effort} of 5: Exa search effort level ${effort}`;
+    ? `${prefix}: ${generator.name}; ${generator.api}, ${generator.detail}${generator.pricing ? `; ${generator.pricing}` : ""}`
+    : `${prefix}: ${t("searchLabel")} ${effort}`;
 }
 
 function menuPricing(pricing: string | undefined) {
@@ -1060,7 +1338,7 @@ type DuckDuckGoInstantAnswer = {
   RelatedTopics?: unknown[];
 };
 
-async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel): Promise<SearchResponse> {
+async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel, limit?: number): Promise<SearchResponse> {
   const startedAt = performance.now();
   // DuckDuckGo Instant Answer is no-key JSON/JSONP for answers and related topics, not a full organic SERP API.
   const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
@@ -1091,12 +1369,12 @@ async function duckDuckGoInstantAnswerSearch(query: string, effort: EffortLevel)
       seen.add(result.url);
       return true;
     })
-    .slice(0, Math.max(3, effort * 3));
+    .slice(0, limit ?? Math.max(3, effort * 3));
 
   if (results.length === 0) {
     results.push({
       url: `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
-      title: `Search DuckDuckGo for ${query}`,
+      title: t("searchDuckDuckGo", { query }),
       provider: "duckduckgo"
     });
   }
@@ -1144,7 +1422,7 @@ function updateEffortBars(bars: HTMLElement, effort: EffortLevel, mode: CommandM
         isAvailable && level <= configuredEffort ? "active" : "",
         isAvailable ? "" : "unavailable"
       ].filter(Boolean).join(" ");
-      const title = isAvailable ? effortDescription(mode, level) : `Level ${level} is not configured`;
+      const title = isAvailable ? effortDescription(mode, level) : t("effortLevelUnconfigured", { level });
       return `<span class="${classes}" data-effort-level="${level}" title="${escapeHtml(title)}" aria-hidden="true"></span>`;
     })
     .join("");
@@ -1175,7 +1453,7 @@ function activeEffortContext() {
   if (entry) {
     const bars = entry.querySelector<HTMLElement>(".effort-bars");
     const effort = normalizeEffortLevel(Number(entry.dataset.effort ?? bars?.dataset.effort ?? 3));
-    const mode: CommandMode = entry.dataset.mode === "ai" ? "ai" : "search";
+    const mode: CommandMode = modeFromDataset(entry.dataset.mode);
     return { bars, entry, effort, mode };
   }
 
@@ -1194,7 +1472,7 @@ function effortContextForBars(bars: HTMLElement): EffortContext {
       bars,
       entry,
       effort: normalizeEffortLevel(Number(entry.dataset.effort ?? bars.dataset.effort ?? 3)),
-      mode: entry.dataset.mode === "ai" ? "ai" : "search"
+      mode: modeFromDataset(entry.dataset.mode)
     };
   }
 
@@ -1270,7 +1548,7 @@ function openEffortMenu(context: EffortContext) {
     .map((level) => {
       const active = level === activeEffort && (context.mode !== "ai" || aiEngine === "openrouter") ? " active" : "";
       return `<button class="effort-menu-option${active}" type="button" role="menuitem" data-effort-level="${level}">
-        <span class="effort-menu-level">Level ${level}</span>
+        ${effortMenuBarsMarkup(context.mode, level)}
         <span class="effort-menu-detail">${escapeHtml(effortMenuDescription(context.mode, level))}</span>
       </button>`;
     })
@@ -1292,6 +1570,161 @@ function openEffortMenu(context: EffortContext) {
   menu.style.top = `${Math.max(8, top)}px`;
 }
 
+function closeFormatMenu() {
+  document.querySelector<HTMLElement>(".format-menu")?.remove();
+  formatMenuContext = undefined;
+}
+
+function commandModeForField(field: CommandField): CommandMode {
+  if (field.closest("form")?.classList.contains("thread-followup")) {
+    return "ai";
+  }
+  const block = field.closest<HTMLElement>(".entry, .current-command");
+  return block ? modeFromDataset(block.dataset.mode) : commandMode;
+}
+
+function visibleFormatMenuOptions(menu: HTMLElement) {
+  return Array.from(menu.querySelectorAll<HTMLElement>(".format-menu-option:not([hidden])"));
+}
+
+function setActiveFormatMenuOption(menu: HTMLElement, option: HTMLElement | undefined) {
+  menu.querySelectorAll(".format-menu-option.active").forEach((other) => other.classList.remove("active"));
+  option?.classList.add("active");
+  option?.scrollIntoView({ block: "nearest" });
+}
+
+function filterFormatMenu(menu: HTMLElement, query: string) {
+  const needle = query.trim().toLowerCase();
+  menu.querySelectorAll<HTMLElement>(".format-menu-option").forEach((option) => {
+    option.hidden = Boolean(needle) && !(option.dataset.filterText ?? "").includes(needle);
+  });
+  const visible = visibleFormatMenuOptions(menu);
+  if (!visible.some((option) => option.classList.contains("active"))) {
+    setActiveFormatMenuOption(menu, visible[0]);
+  }
+}
+
+// Selecting a result type edits the query itself: the typed-output marker in
+// the text (e.g. #Restaurant[]) stays the single source of truth for the
+// requested schema, so swapping types rewrites or appends that marker.
+function applyTypedOutputSelection(field: CommandField, mode: CommandMode, descriptor?: TypedOutputDescriptor) {
+  const refs = typedOutputReferences(field.value);
+  if (!descriptor) {
+    field.value = stripTypedOutputMarkers(field.value);
+  } else if (refs.length > 0) {
+    let value = field.value;
+    for (let index = refs.length - 1; index >= 1; index -= 1) {
+      value = `${value.slice(0, refs[index]!.start)}${value.slice(refs[index]!.end)}`;
+    }
+    const first = refs[0]!;
+    field.value = `${value.slice(0, first.start)}${descriptor.marker}${value.slice(first.end)}`.replace(/\s{2,}/g, " ");
+  } else {
+    const base = field.value.replace(/\s+$/, "");
+    field.value = base ? `${base} ${descriptor.marker}` : descriptor.marker;
+  }
+  resizeCommandField(field);
+  updateCommandHighlight(field);
+  updateResultFormatIndicator(field, mode);
+  field.focus();
+  field.setSelectionRange(field.value.length, field.value.length);
+}
+
+function selectFormatMenuOption(option: HTMLElement) {
+  const context = formatMenuContext;
+  closeFormatMenu();
+  if (!context) {
+    return;
+  }
+  const choice = option.dataset.formatChoice;
+  const descriptor = choice && choice !== "default"
+    ? typedOutputs.find((entry) => entry.id === choice)
+    : undefined;
+  applyTypedOutputSelection(context.field, context.mode, descriptor);
+}
+
+function formatMenuOptionMarkup(choice: string, kind: ResultFormatKind, name: string, detail: string, active: boolean) {
+  const filterText = `${name} ${detail}`.toLowerCase();
+  return `<button class="format-menu-option${active ? " active" : ""}" type="button" role="option" data-format-choice="${escapeHtml(choice)}" data-filter-text="${escapeHtml(filterText)}">
+    <span class="format-menu-icon">${resultFormatIconMarkup(kind)}</span>
+    <span class="format-menu-name">${escapeHtml(name)}</span>
+    <span class="format-menu-detail">${escapeHtml(detail)}</span>
+  </button>`;
+}
+
+function openFormatMenu(indicator: HTMLElement) {
+  closeEffortMenu();
+  closeFormatMenu();
+  const form = indicator.closest<HTMLElement>("form");
+  const field = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+  if (!form || !field) {
+    return;
+  }
+  const mode = commandModeForField(field);
+  formatMenuContext = { field, form, mode };
+
+  const activeId = typedOutputReferences(field.value)[0]?.descriptor.id;
+  const fallback = defaultResultFormat(mode);
+  const menu = document.createElement("div");
+  menu.className = "format-menu";
+  menu.setAttribute("role", "listbox");
+  menu.setAttribute("aria-label", "Select result type");
+  const passwordManagerIgnoreAttrs = ` autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other"`;
+  menu.innerHTML = `<input class="format-menu-search" type="text" placeholder="Search result types" aria-label="Search result types"${passwordManagerIgnoreAttrs}>
+    <div class="format-menu-options">
+      ${formatMenuOptionMarkup("default", fallback.kind, fallback.label, "Default; free-form result", !activeId)}
+      ${typedOutputs.map((descriptor) => formatMenuOptionMarkup(
+        descriptor.id,
+        resultFormatForTypedOutput(descriptor).kind,
+        descriptor.name,
+        descriptor.description,
+        descriptor.id === activeId
+      )).join("")}
+    </div>`;
+  document.body.append(menu);
+
+  const rect = indicator.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const left = Math.min(Math.max(8, rect.right - menuRect.width), window.innerWidth - menuRect.width - 8);
+  const top = Math.min(rect.bottom + 8, window.innerHeight - menuRect.height - 8);
+  menu.style.left = `${Math.max(8, left)}px`;
+  menu.style.top = `${Math.max(8, top)}px`;
+
+  const search = menu.querySelector<HTMLInputElement>(".format-menu-search");
+  search?.addEventListener("input", () => filterFormatMenu(menu, search.value));
+  search?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      const contextField = formatMenuContext?.field;
+      closeFormatMenu();
+      contextField?.focus();
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const visible = visibleFormatMenuOptions(menu);
+      if (visible.length === 0) {
+        return;
+      }
+      const index = visible.findIndex((option) => option.classList.contains("active"));
+      const next = event.key === "ArrowDown"
+        ? visible[Math.min(index + 1, visible.length - 1)]
+        : visible[Math.max(index - 1, 0)];
+      setActiveFormatMenuOption(menu, next);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const visible = visibleFormatMenuOptions(menu);
+      const choice = visible.find((option) => option.classList.contains("active")) ?? visible[0];
+      if (choice) {
+        selectFormatMenuOption(choice);
+      }
+    }
+  });
+  search?.focus();
+}
+
 function setCommandMode(mode: CommandMode) {
   commandMode = mode;
   if (currentCommand) {
@@ -1302,10 +1735,11 @@ function setCommandMode(mode: CommandMode) {
     updateEffortBars(bars, effortLevel, commandMode);
   }
   if (commandPrompt) {
-    commandPrompt.textContent = mode === "ai" ? "*" : ">";
+    commandPrompt.textContent = promptGlyphFor(mode);
   }
   if (input) {
-    input.setAttribute("aria-label", mode === "ai" ? "AI prompt" : "Search");
+    input.setAttribute("aria-label", t(promptModeFor(mode).ariaKey));
+    updateResultFormatIndicator(input, mode);
     scheduleSuggest(input);
   }
 }
@@ -1316,13 +1750,14 @@ function setInputCommandMode(searchInput: CommandField, mode: CommandMode) {
     entry.dataset.mode = mode;
     const prompt = entry.querySelector<HTMLElement>(".prompt");
     if (prompt) {
-      prompt.textContent = mode === "ai" ? "*" : ">";
+      prompt.textContent = promptGlyphFor(mode);
     }
-    searchInput.setAttribute("aria-label", mode === "ai" ? "AI prompt" : "Previous search");
+    searchInput.setAttribute("aria-label", t(promptModeFor(mode).previousAriaKey));
     const bars = entry.querySelector<HTMLElement>(".effort-bars");
     if (bars) {
       updateEffortBars(bars, normalizeEffortLevel(Number(entry.dataset.effort ?? 3)), mode);
     }
+    updateResultFormatIndicator(searchInput, mode);
     scheduleSuggest(searchInput);
     return;
   }
@@ -1366,6 +1801,7 @@ function selectionForCommandInput(searchInput: CommandField, preserveCurrentSele
 }
 
 function focusCommandInput(searchInput: CommandField, selection = selectionForCommandInput(searchInput)) {
+  lastVoiceInput = searchInput;
   searchInput.focus({ preventScroll: true });
   searchInput.setSelectionRange(selection.start, selection.end, selection.direction);
 }
@@ -1379,6 +1815,84 @@ function isEnterKeyEvent(event: KeyboardEvent) {
     event.which === 13;
 }
 
+function isLuckyEnterEvent(event: KeyboardEvent) {
+  return isEnterKeyEvent(event) &&
+    (event.metaKey || event.ctrlKey) &&
+    !event.altKey &&
+    !event.shiftKey &&
+    !event.isComposing;
+}
+
+function openLuckyTarget() {
+  const target = window.open("about:blank", "_blank");
+  try {
+    if (target?.document) {
+      target.document.title = "zip.cat";
+      target.document.body.innerHTML = `<main style="font:16px system-ui,sans-serif;margin:2rem;color:#111">Opening...</main>`;
+    }
+    target?.focus();
+  } catch {
+    // Cross-window access can fail in hardened browser contexts.
+  }
+  return target;
+}
+
+function normalizeHttpUrl(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function navigateLuckyTarget(lucky: LuckySubmit | undefined, url: string) {
+  const normalized = normalizeHttpUrl(url);
+  if (!normalized) {
+    failLuckyTarget(lucky, "No valid URL was returned.");
+    return false;
+  }
+
+  if (lucky?.target && !lucky.target.closed) {
+    try {
+      lucky.target.opener = null;
+    } catch {
+      // Best effort only; navigation below is the important part.
+    }
+    lucky.target.location.href = normalized;
+    try {
+      lucky.target.focus();
+    } catch {
+      // Focus can be blocked by browser settings.
+    }
+    return true;
+  }
+
+  window.open(normalized, "_blank", "noopener,noreferrer")?.focus();
+  return true;
+}
+
+function failLuckyTarget(lucky: LuckySubmit | undefined, message: string) {
+  if (!lucky?.target || lucky.target.closed) {
+    return;
+  }
+
+  try {
+    lucky.target.document.title = "zip.cat";
+    lucky.target.document.body.innerHTML = `<main style="font:16px system-ui,sans-serif;margin:2rem;color:#111">${escapeHtml(message)}</main>`;
+  } catch {
+    try {
+      lucky.target.close();
+    } catch {
+      // Nothing else to do.
+    }
+  }
+}
 
 function shortcutFromCode(code: string) {
   if (/^Digit[1-9]$/.test(code)) {
@@ -1481,8 +1995,8 @@ function setRunStatus(
   if (state === "active") {
     entry?.classList.add(`run-active-${kind}`);
   }
-  const statusLabel = label ?? (kind === "ai" ? "AI" : "Search");
-  mark.setAttribute("aria-label", `${statusLabel} ${state}`);
+  const statusLabel = label ?? (kind === "ai" ? t("aiLabel") : t("searchLabel"));
+  mark.setAttribute("aria-label", `${statusLabel} ${localizedRunState(state)}`);
   if (state === "idle") {
     mark.removeAttribute("title");
     return;
@@ -1506,7 +2020,7 @@ function resetRunStatus(results: HTMLElement) {
   marks?.forEach((mark) => {
     mark.classList.remove("used", "active", "done", "error");
     mark.removeAttribute("title");
-    mark.setAttribute("aria-label", `${mark.dataset.statusKind === "ai" ? "AI" : "Search"} idle`);
+    mark.setAttribute("aria-label", `${mark.dataset.statusKind === "ai" ? t("aiLabel") : t("searchLabel")} ${t("statusIdle")}`);
   });
 }
 
@@ -1774,10 +2288,8 @@ function toggleCommandMode() {
   }
 
   const entry = sourceInput.closest<HTMLElement>(".entry");
-  const currentMode: CommandMode = entry
-    ? entry.dataset.mode === "ai" ? "ai" : "search"
-    : commandMode;
-  setInputCommandMode(sourceInput, currentMode === "search" ? "ai" : "search");
+  const currentMode: CommandMode = entry ? modeFromDataset(entry.dataset.mode) : commandMode;
+  setInputCommandMode(sourceInput, nextCommandMode(currentMode));
 }
 
 function isEffortModifier(event: KeyboardEvent) {
@@ -1930,6 +2442,54 @@ function renderAiText(text: string) {
   return `<div class="ai-response">${decorateWindowReferences(sanitizeMarkdownHtml(html))}</div>`;
 }
 
+function parseTypedOutputJson(text: string, descriptor: TypedOutputDescriptor) {
+  const trimmed = text.trim();
+  const unwrapped = trimmed.startsWith("```")
+    ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
+    : trimmed;
+  const jsonText = unwrapped.match(/(?:\{[\s\S]*\}|\[[\s\S]*\]|true|false|null|"[^"]*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/)?.[0] ?? unwrapped;
+  const parsed = JSON.parse(jsonText) as unknown;
+
+  if (descriptor.renderer === "url") {
+    if (typeof parsed === "string") {
+      const url = normalizeHttpUrl(parsed);
+      if (url) {
+        return url;
+      }
+    }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      for (const key of ["url", "href", "link"]) {
+        if (typeof record[key] === "string") {
+          const url = normalizeHttpUrl(record[key]);
+          if (url) {
+            return url;
+          }
+        }
+      }
+    }
+    throw new Error("Typed URL output did not contain an absolute http(s) URL.");
+  }
+
+  return parsed;
+}
+
+function typedOutputResultFromText(text: string, descriptor: TypedOutputDescriptor): TypedOutputResult {
+  return {
+    descriptor,
+    value: parseTypedOutputJson(text, descriptor),
+    rawText: text
+  };
+}
+
+function urlFromTypedOutput(output: TypedOutputResult | undefined) {
+  if (!output || output.descriptor.renderer !== "url") {
+    return undefined;
+  }
+
+  return typeof output.value === "string" ? normalizeHttpUrl(output.value) : undefined;
+}
+
 function stringValue(record: Record<string, unknown>, key: string) {
   const value = record[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -1995,6 +2555,14 @@ function renderTypedOutput(output: TypedOutputResult | undefined, fallbackText: 
   if (output.descriptor.renderer === "boolean") {
     if (typeof output.value === "boolean") {
       return `<div class="ai-response typed-response typed-bool">${output.value ? "True" : "False"}</div>`;
+    }
+    return `<div class="ai-response typed-response"><pre class="typed-json">${escapeHtml(JSON.stringify(output.value, null, 2))}</pre></div>`;
+  }
+
+  if (output.descriptor.renderer === "url") {
+    const url = typeof output.value === "string" ? normalizeHttpUrl(output.value) : undefined;
+    if (url) {
+      return `<div class="ai-response typed-response"><p><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a></p></div>`;
     }
     return `<div class="ai-response typed-response"><pre class="typed-json">${escapeHtml(JSON.stringify(output.value, null, 2))}</pre></div>`;
   }
@@ -2103,6 +2671,113 @@ function renderWeatherCard(output: unknown) {
   </section>`;
 }
 
+function formatStockPrice(value: unknown, currency: string | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "--";
+  }
+
+  const currencyCode = /^[A-Z]{3}$/.test(currency ?? "") ? currency! : "USD";
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: currencyCode,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: value >= 10 ? 2 : 4
+    }).format(value);
+  } catch {
+    return `${value.toFixed(value >= 10 ? 2 : 4)} ${currency ?? ""}`.trim();
+  }
+}
+
+function stockSparkline(points: Array<{ date?: string; close?: number }>, previousClose: unknown, price: unknown) {
+  const numericPoints = points
+    .filter((point): point is { date?: string; close: number } => (
+      typeof point.close === "number" && Number.isFinite(point.close)
+    ));
+
+  if (numericPoints.length < 2) {
+    if (typeof previousClose === "number" && typeof price === "number" && Number.isFinite(previousClose) && Number.isFinite(price)) {
+      numericPoints.splice(0, numericPoints.length, { close: previousClose }, { close: price });
+    }
+  }
+
+  if (numericPoints.length < 2) {
+    return `<div class="stock-sparkline stock-sparkline-empty" aria-label="No chart data"></div>`;
+  }
+
+  const width = 164;
+  const height = 42;
+  const padding = 3;
+  const values = numericPoints.map((point) => point.close);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const spread = max - min || 1;
+  const chartWidth = width - padding * 2;
+  const chartHeight = height - padding * 2;
+  const svgPoints = numericPoints.map((point, index) => {
+    const x = padding + (index / (numericPoints.length - 1)) * chartWidth;
+    const y = padding + ((max - point.close) / spread) * chartHeight;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const first = numericPoints[0]?.close;
+  const last = numericPoints[numericPoints.length - 1]?.close;
+  const direction = last >= first ? "up" : "down";
+
+  return `<svg class="stock-sparkline stock-sparkline-${direction}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Stock price trend">
+    <polyline points="${svgPoints}" vector-effect="non-scaling-stroke"></polyline>
+  </svg>`;
+}
+
+function renderStockCard(output: unknown) {
+  if (!output || typeof output !== "object") {
+    return `<div class="status">No stock output.</div>`;
+  }
+
+  const stock = output as {
+    symbol?: string;
+    price?: number;
+    currency?: string;
+    change?: number;
+    changePercent?: number;
+    previousClose?: number;
+    asOf?: string;
+    sparkline?: Array<{
+      date?: string;
+      close?: number;
+    }>;
+    source?: {
+      name?: string;
+      url?: string;
+    };
+  };
+  const change = typeof stock.change === "number" && Number.isFinite(stock.change) ? stock.change : 0;
+  const changePercent = typeof stock.changePercent === "number" && Number.isFinite(stock.changePercent) ? stock.changePercent : 0;
+  const direction = change > 0 ? "up" : change < 0 ? "down" : "flat";
+  const sign = change > 0 ? "+" : "";
+  const price = formatStockPrice(stock.price, stock.currency);
+  const changeText = `${sign}${change.toFixed(2)} (${sign}${changePercent.toFixed(2)}%)`;
+  const sourceName = stock.source?.name ?? "Yahoo Finance";
+  const sourceUrl = stock.source?.url;
+  const source = sourceUrl
+    ? `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(sourceName)}</a>`
+    : escapeHtml(sourceName);
+
+  return `<section class="stock-card stock-${direction}">
+    <div class="stock-topline">
+      <div>
+        <div class="stock-symbol">${escapeHtml(stock.symbol ?? "Stock")}</div>
+        <div class="stock-price">${escapeHtml(price)}</div>
+      </div>
+      ${stockSparkline(stock.sparkline ?? [], stock.previousClose, stock.price)}
+    </div>
+    <div class="stock-meta">
+      <span class="stock-change">${escapeHtml(changeText)}</span>
+      ${stock.asOf ? `<span>${escapeHtml(stock.asOf)}</span>` : ""}
+      <span>${source}</span>
+    </div>
+  </section>`;
+}
+
 function renderLanesCard(output: unknown) {
   if (!output || typeof output !== "object") {
     return `<div class="status">No reservations.</div>`;
@@ -2119,13 +2794,100 @@ function renderLanesCard(output: unknown) {
       lane?: string;
       who?: string;
     }>;
+    availableOpenings?: Array<{
+      date?: string;
+      weekday?: string;
+      startTime?: string;
+      endTime?: string;
+      lanes?: string[];
+    }>;
+    days?: Array<{
+      date?: string;
+      weekday?: string;
+      reservations?: Array<{
+        date?: string;
+        weekday?: string;
+        startTime?: string;
+        endTime?: string;
+        lane?: string;
+        who?: string;
+      }>;
+      availableOpenings?: Array<{
+        date?: string;
+        weekday?: string;
+        startTime?: string;
+        endTime?: string;
+        lanes?: string[];
+      }>;
+    }>;
     source?: { name?: string };
   };
   const reservations = lanes.reservations ?? [];
+  const openings = lanes.availableOpenings ?? [];
+  const days = lanes.days ?? [];
   const windowDays = typeof lanes.windowDays === "number" ? lanes.windowDays : 5;
   const heading = `${escapeHtml(lanes.club ?? "Swim lanes")} · next ${windowDays} days`;
+  const renderOpening = (opening: { startTime?: string; endTime?: string; lanes?: string[] }) => {
+    const laneCount = opening.lanes?.length ?? 0;
+    const laneLabel = laneCount === 1 ? opening.lanes?.[0] ?? "1 lane" : `${laneCount} lanes`;
+    return `<span class="lanes-open-time" title="${escapeHtml((opening.lanes ?? []).join(", "))}">
+      ${escapeHtml([opening.startTime, opening.endTime].filter(Boolean).join("–"))}
+      <span>${escapeHtml(laneLabel)}</span>
+    </span>`;
+  };
+
+  if (days.length > 0) {
+    const dayRows = days.map((day) => {
+      const dayLabel = [day.weekday, day.date].filter(Boolean).join(" ") || "—";
+      const dayReservations = day.reservations ?? [];
+      const dayOpenings = day.availableOpenings ?? [];
+      const content = dayReservations.length > 0
+        ? `<ul class="lanes-list">${dayReservations.map((reservation) => {
+          const time = [reservation.startTime, reservation.endTime].filter(Boolean).join("–");
+          return `<li class="lanes-row lanes-row-compact">
+            <span class="lanes-time">${escapeHtml(time || "—")}</span>
+            <span class="lanes-lane">${escapeHtml(reservation.lane ?? "Lane")}</span>
+            <span class="lanes-who">${escapeHtml(reservation.who ?? "")}</span>
+          </li>`;
+        }).join("")}</ul>`
+        : dayOpenings.length > 0
+          ? `<div class="lanes-open-times">${dayOpenings.map(renderOpening).join("")}</div>`
+          : `<div class="lanes-none">None available</div>`;
+      return `<div class="lanes-open-day">
+        <div class="lanes-open-date">${escapeHtml(dayLabel)}</div>
+        ${content}
+      </div>`;
+    }).join("");
+
+    return `<section class="lanes-card">
+      <div class="lanes-heading">${heading}</div>
+      <div class="lanes-open-list">${dayRows}</div>
+      <div class="lanes-source">${escapeHtml(lanes.source?.name ?? "Clubspot")}</div>
+    </section>`;
+  }
 
   if (reservations.length === 0) {
+    if (openings.length > 0) {
+      const groupedOpenings = new Map<string, typeof openings>();
+      openings.forEach((opening) => {
+        const day = [opening.weekday, opening.date].filter(Boolean).join(" ") || "Open";
+        groupedOpenings.set(day, [...(groupedOpenings.get(day) ?? []), opening]);
+      });
+      const openingRows = [...groupedOpenings.entries()].map(([day, dayOpenings]) => (
+        `<div class="lanes-open-day">
+          <div class="lanes-open-date">${escapeHtml(day)}</div>
+          <div class="lanes-open-times">
+            ${dayOpenings.map(renderOpening).join("")}
+          </div>
+        </div>`
+      )).join("");
+      return `<section class="lanes-card">
+        <div class="lanes-heading">${heading}</div>
+        <div class="lanes-empty">No swim-lane reservations. Open times:</div>
+        <div class="lanes-open-list">${openingRows}</div>
+        <div class="lanes-source">${escapeHtml(lanes.source?.name ?? "Clubspot")}</div>
+      </section>`;
+    }
     return `<section class="lanes-card">
       <div class="lanes-heading">${heading}</div>
       <div class="lanes-empty">No swim-lane reservations.</div>
@@ -2158,6 +2920,10 @@ function renderSlashCommandOutput(payload: SlashCommandResponse) {
 
   if (payload.placement.renderer === "lanes-card") {
     return renderLanesCard(payload.output);
+  }
+
+  if (payload.placement.renderer === "stock-card") {
+    return renderStockCard(payload.output);
   }
 
   return `<pre class="slash-json">${escapeHtml(JSON.stringify(payload.output, null, 2))}</pre>`;
@@ -2217,7 +2983,7 @@ function commandBlockSnapshot(index: number) {
   }
 
   const query = block.querySelector<CommandField>('textarea[name="q"], input[name="q"]')?.value.trim() ?? "";
-  const mode: CommandMode = block.dataset.mode === "ai" ? "ai" : "search";
+  const mode: CommandMode = modeFromDataset(block.dataset.mode);
   const debugData = debugResultData(block);
   const searchResults = Array.from(block.querySelectorAll<HTMLTableRowElement>(".results table tbody tr"))
     .map((row, resultIndex) => {
@@ -2313,15 +3079,130 @@ function clearSuggestionsFor(searchInput: CommandField) {
   suggestionContextFor(searchInput)?.replaceChildren();
 }
 
+// Token that owns the most recent async implicit render per input, so a slower
+// in-flight render can't overwrite a newer one (last write wins by recency).
+const implicitRenderToken = new WeakMap<CommandField, number>();
+let implicitRenderCounter = 0;
+
+// The implicit result has its OWN container (a sibling of the suggestion aside),
+// so the suggest pipeline's clearing of `.query-suggestions` can't wipe it. Lazily
+// created per query-row on first use.
+function implicitContainerFor(searchInput: CommandField): HTMLElement | undefined {
+  const row = searchInput.closest<HTMLElement>(".query-row");
+  if (!row) {
+    return undefined;
+  }
+  let container = row.querySelector<HTMLElement>(".implicit-results");
+  if (!container) {
+    container = document.createElement("aside");
+    container.className = "implicit-results";
+    const suggestions = row.querySelector(".query-suggestions");
+    if (suggestions) {
+      suggestions.after(container);
+    } else {
+      row.append(container);
+    }
+  }
+  return container;
+}
+
+function clearImplicitResult(searchInput: CommandField) {
+  const row = searchInput.closest<HTMLElement>(".query-row");
+  row?.querySelector(".implicit-results")?.replaceChildren();
+}
+
+// Inline-live implicit pickups: as the user types a bare formula / conversion /
+// ticker (no leading slash), surface the result beneath the input with NO
+// network for offline commands and NO Enter required. Pure client-side, driven
+// by the same static detectors the eval library tests.
+function updateImplicitResult(searchInput: CommandField) {
+  const container = implicitContainerFor(searchInput);
+  if (!container) {
+    return;
+  }
+  clearImplicitResult(searchInput);
+
+  const query = searchInput.value;
+  if (isSlashCommandInput(query)) {
+    return;
+  }
+
+  const detection = detectImplicitCommand(query);
+  if (!detection) {
+    return;
+  }
+
+  const token = ++implicitRenderCounter;
+  implicitRenderToken.set(searchInput, token);
+
+  const stillCurrent = () =>
+    implicitRenderToken.get(searchInput) === token &&
+    activeSearchInput() === searchInput &&
+    searchInput.value === query;
+
+  const mount = (innerHtml: string) => {
+    if (!stillCurrent()) {
+      return;
+    }
+    const block = document.createElement("div");
+    block.className = "implicit-result";
+    block.dataset.commandId = detection.commandId;
+    block.innerHTML = innerHtml;
+    container.replaceChildren(block);
+  };
+
+  if (detection.config.implicit.render === "pill") {
+    // Network/side-effecting commands: offer a pill that runs the full command
+    // on click rather than firing a request on every keystroke. We rewrite the
+    // implicit input to the explicit `/command <primary-arg>` form so the normal
+    // slash-command path handles execution + caching.
+    const primaryArg = Object.values(detection.match.args)[0];
+    const explicit = primaryArg === undefined
+      ? detection.command.command
+      : `${detection.command.command} ${String(primaryArg)}`;
+    const label = escapeHtml(detection.match.label ?? detection.command.name);
+    mount(
+      `<button type="button" class="implicit-pill" data-implicit-run="${escapeHtml(explicit)}">` +
+      `<span class="implicit-pill-cmd">${escapeHtml(detection.command.command)}</span>` +
+      `<span class="implicit-pill-label">${label}</span></button>`
+    );
+    return;
+  }
+
+  // inline-live: execute the command client-side. calc/convert are pure +
+  // offline, so executeCommand resolves without a network round-trip.
+  void (async () => {
+    try {
+      const context = createSlashContext({ query });
+      const args = detection.command.parseArguments(context);
+      const output = await detection.command.executeCommand(args, context);
+      const payload = {
+        commandId: detection.commandId,
+        commandName: detection.command.name,
+        command: detection.command.command,
+        query,
+        args,
+        placement: detection.command.placement,
+        schema: detection.command.outputSchema,
+        output,
+        elapsedMs: 0
+      } satisfies SlashCommandResponse;
+      mount(`<div class="implicit-result-body">${renderSlashCommandOutput(payload)}</div>`);
+    } catch {
+      // A half-typed expression that doesn't yet evaluate just shows nothing.
+      if (stillCurrent()) {
+        clearImplicitResult(searchInput);
+      }
+    }
+  })();
+}
+
 function renderSuggestionsForInput(sourceInput: CommandField, suggestionContext: HTMLElement, payload: SuggestResponse) {
   const shortcutOffset = resultShortcutCountFor(sourceInput);
   suggestionContext.innerHTML = payload.suggestions
     .map((suggestion, index) => renderSuggestionPill(suggestion, index + shortcutOffset))
     .join("");
   clearSuggestionSelection();
-  if (sourceInput === input) {
-    scrollToPrompt();
-  }
 }
 
 function rerunEmptyTypedServerEntries() {
@@ -2336,7 +3217,7 @@ function rerunEmptyTypedServerEntries() {
       return;
     }
 
-    const hasRenderedContent = Boolean(results.querySelector("table, .ai-response, .status, .weather-card, .restaurant-card"));
+    const hasRenderedContent = Boolean(results.querySelector("table, .ai-response, .status, .weather-card, .stock-card, .restaurant-card"));
     if (hasRenderedContent || results.textContent?.trim()) {
       return;
     }
@@ -2442,7 +3323,8 @@ function bindSuggestionInput(searchInput: CommandField) {
       !keyboardEvent.isComposing &&
       (
         acceptTypedOutputGhost(searchInput) ||
-        acceptSlashCommandGhost(searchInput)
+        acceptSlashCommandGhost(searchInput) ||
+        acceptImplicitGhost(searchInput)
       )
     ) {
       keyboardEvent.preventDefault();
@@ -2451,10 +3333,23 @@ function bindSuggestionInput(searchInput: CommandField) {
 
     if (
       !isEnterKeyEvent(keyboardEvent) ||
-      keyboardEvent.ctrlKey ||
-      keyboardEvent.metaKey ||
       keyboardEvent.isComposing
     ) {
+      return;
+    }
+
+    if (isLuckyEnterEvent(keyboardEvent)) {
+      keyboardEvent.preventDefault();
+      if (searchInput.form) {
+        luckySubmits.set(searchInput.form, {
+          target: openLuckyTarget()
+        });
+        searchInput.form.requestSubmit();
+      }
+      return;
+    }
+
+    if (keyboardEvent.ctrlKey || keyboardEvent.metaKey) {
       return;
     }
 
@@ -2470,6 +3365,7 @@ function bindSuggestionInput(searchInput: CommandField) {
     updateSlashCommandControls(searchInput);
     updateCommandHighlight(searchInput);
     scheduleSuggest(searchInput);
+    updateImplicitResult(searchInput);
     clearSuggestionSelection();
   });
   searchInput.addEventListener("focus", () => {
@@ -2644,6 +3540,58 @@ document.addEventListener("click", (event) => {
   void runSlashCommand(query, results, entryInput, { forceRefresh: true });
 });
 
+// Clicking an implicit pill (e.g. a ticker quote) runs the full command: drop
+// the explicit `/command arg` form into the active input and submit it.
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const pill = target.closest<HTMLElement>(".implicit-pill");
+  if (!pill) {
+    return;
+  }
+  event.preventDefault();
+  const explicit = pill.dataset.implicitRun;
+  const activeInput = activeSearchInput() ?? input;
+  if (!explicit || !activeInput) {
+    return;
+  }
+  activeInput.value = explicit;
+  resizeCommandField(activeInput);
+  updateSlashCommandControls(activeInput);
+  updateCommandHighlight(activeInput);
+  clearImplicitResult(activeInput);
+  activeInput.form?.requestSubmit();
+});
+
+// Clicking the prompt glyph (> / * / ...) cycles through the registered prompt
+// modes, wrapping around. AI-thread follow-up prompts are locked to AI, so they
+// don't cycle.
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const prompt = target.closest<HTMLElement>(".prompt");
+  if (!prompt) {
+    return;
+  }
+  const form = prompt.closest<HTMLElement>("form");
+  if (!form || form.classList.contains("thread-followup")) {
+    return;
+  }
+  const field = form.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+  if (!field) {
+    return;
+  }
+  event.preventDefault();
+  const entry = field.closest<HTMLElement>(".entry");
+  const currentMode: CommandMode = entry ? modeFromDataset(entry.dataset.mode) : commandMode;
+  setInputCommandMode(field, nextCommandMode(currentMode));
+  field.focus();
+});
+
 document.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof Element)) {
@@ -2664,7 +3612,7 @@ document.addEventListener("dblclick", (event) => {
     return;
   }
 
-  if (target.closest("textarea, input, a, button, .effort-menu, .effort-bars, .window-ref-pill")) {
+  if (target.closest("textarea, input, a, button, .effort-menu, .effort-bars, .window-ref-pill, .format-indicator, .format-menu")) {
     return;
   }
 
@@ -2732,6 +3680,51 @@ document.addEventListener("click", (event) => {
   }
 
   closeEffortMenu();
+});
+
+// The result-format indicator opens a searchable result-type picker; choosing
+// an option rewrites the typed-output marker in the query.
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+
+  const option = target.closest<HTMLElement>(".format-menu-option");
+  if (option && formatMenuContext) {
+    event.preventDefault();
+    selectFormatMenuOption(option);
+    return;
+  }
+
+  if (target.closest(".format-menu")) {
+    return;
+  }
+
+  const indicator = target.closest<HTMLElement>(".format-indicator");
+  if (indicator) {
+    event.preventDefault();
+    if (formatMenuContext && formatMenuContext.form === indicator.closest("form")) {
+      closeFormatMenu();
+      return;
+    }
+    openFormatMenu(indicator);
+    return;
+  }
+
+  closeFormatMenu();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") {
+    return;
+  }
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || !target.classList.contains("format-indicator")) {
+    return;
+  }
+  event.preventDefault();
+  openFormatMenu(target);
 });
 
 if (staticMode) {
@@ -3070,7 +4063,7 @@ async function resolveInlineQuery(query: string, effort: EffortLevel) {
   };
 }
 
-async function runSearch(query: string, results: HTMLElement, effort: EffortLevel) {
+async function runSearch(query: string, results: HTMLElement, effort: EffortLevel, lucky?: LuckySubmit) {
   results.innerHTML = "";
   resetRunStatus(results);
 
@@ -3093,11 +4086,12 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
       resizeCommandField(resolvedInput);
       updateCommandHighlight(resolvedInput);
     }
-    const typedOutput = typedOutputReferences(resolved.resolvedQuery)[0]?.descriptor;
+    const typedOutput = lucky ? undefined : typedOutputReferences(resolved.resolvedQuery)[0]?.descriptor;
     const searchQuery = typedOutput ? stripTypedOutputMarkers(resolved.resolvedQuery) : resolved.resolvedQuery;
     setRunStatus(results, "search", "active");
     const searchRequestBody = {
       query: searchQuery,
+      limit: defaultSearchResultLimit(),
       effort,
       trigger: {
         type: "keyboard",
@@ -3117,9 +4111,9 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
           "content-type": "application/json"
         },
         body: JSON.stringify(searchRequestBody)
-      });
+    });
     const payload = useDuckDuckGoInstant
-      ? await duckDuckGoInstantAnswerSearch(searchQuery, effort) as SearchResponse & { error?: string }
+      ? await duckDuckGoInstantAnswerSearch(searchQuery, effort, searchRequestBody.limit) as SearchResponse & { error?: string }
       : await (response as Response).json() as SearchResponse & { error?: string };
     const searchCallPricing = searchCallPricingDescription(effort, payload.results?.length ?? 0);
     setEntryDebug(results, {
@@ -3142,11 +4136,21 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
 
     if (!response.ok) {
       setRunStatus(results, "search", "error", payload.elapsedMs, "Search", searchCallPricing);
+      failLuckyTarget(lucky, payload.error ?? "Search failed.");
       results.innerHTML = `<div class="status">${escapeHtml(payload.error ?? "Search failed.")}</div>`;
       return;
     }
 
     setRunStatus(results, "search", "done", payload.elapsedMs, "Search", searchCallPricing);
+    if (lucky) {
+      const firstUrl = payload.results?.[0]?.url;
+      if (firstUrl && navigateLuckyTarget(lucky, firstUrl)) {
+        results.innerHTML = `<div class="status">Opening ${escapeHtml(firstUrl)}</div>${renderRows(payload.results ?? [])}`;
+      } else {
+        results.innerHTML = `<div class="status">No search result URL to open.</div>${renderRows(payload.results ?? [])}`;
+      }
+      return;
+    }
     results.innerHTML = renderRows(payload.results ?? []);
     if (typedOutput && staticMode) {
       setRunStatus(results, "ai", "error", undefined, "Typed AI", "$0");
@@ -3233,6 +4237,7 @@ async function runSearch(query: string, results: HTMLElement, effort: EffortLeve
     });
     setRunStatus(results, inlineInferenceSpans(query).length > 0 || typedOutputReferences(query).length > 0 ? "ai" : "search", "error");
     setInlineInferenceHighlight(results, query, false);
+    failLuckyTarget(lucky, error instanceof Error ? error.message : "Search failed.");
     results.innerHTML = `<div class="status">${escapeHtml(error instanceof Error ? error.message : "Search failed.")}</div>`;
   }
 }
@@ -3262,10 +4267,11 @@ function cacheChipMarkup(hit: { storedAt: number; ttlMs: number } | undefined) {
   const ageMs = Math.max(Date.now() - hit.storedAt, 0);
   const stale = ageMs >= hit.ttlMs;
   const label = formatAge(ageMs);
-  const title = `Updated ${label === "now" ? "just now" : `${label} ago`}${stale ? " · stale" : ""}. Click refresh to update.`;
+  const updated = label === "now" ? t("cacheUpdatedNow") : t("cacheUpdatedAgo", { age: label });
+  const title = `${updated}${stale ? t("cacheStaleSuffix") : ""}. ${t("cacheClickRefresh")}`;
   return `<div class="cache-chip${stale ? " cache-chip-stale" : ""}" data-stored-at="${hit.storedAt}" data-ttl="${hit.ttlMs}">
     <span class="cache-age" title="${escapeHtml(title)}">${escapeHtml(label)}</span>
-    <button type="button" class="cache-refresh" aria-label="Refresh" title="Refresh now">↻</button>
+    <button type="button" class="cache-refresh" aria-label="${escapeHtml(t("refresh"))}" title="${escapeHtml(t("refreshNow"))}">↻</button>
   </div>`;
 }
 
@@ -3657,7 +4663,8 @@ async function runBrowserGemmaPrompt(
   typedOutput: TypedOutputDescriptor | undefined,
   results: HTMLElement,
   effort: EffortLevel,
-  thread?: AiThreadContext
+  thread?: AiThreadContext,
+  lucky?: LuckySubmit
 ) {
   const requestId = crypto.randomUUID();
   const requestBody = {
@@ -3701,6 +4708,7 @@ async function runBrowserGemmaPrompt(
     const finishWithError = (message: string) => {
       cleanup();
       setRunStatus(results, "ai", "error", undefined, "Gemma", "$0");
+      failLuckyTarget(lucky, message);
       results.innerHTML = `<div class="status">${escapeHtml(message)}</div>`;
       resolve();
     };
@@ -3735,9 +4743,30 @@ async function runBrowserGemmaPrompt(
       if (message.type === "done") {
         cleanup();
         lastText = message.text;
-        results.innerHTML = renderAiText(lastText);
-        assignAiLinkShortcuts(results);
         setRunStatus(results, "ai", "done", message.elapsedMs, "Gemma", "$0");
+        let parsedTypedOutput: TypedOutputResult | undefined;
+        if (typedOutput) {
+          try {
+            parsedTypedOutput = typedOutputResultFromText(lastText, typedOutput);
+          } catch (error) {
+            if (lucky) {
+              failLuckyTarget(lucky, error instanceof Error ? error.message : "AI did not return a URL.");
+            }
+          }
+        }
+        if (lucky) {
+          const url = urlFromTypedOutput(parsedTypedOutput);
+          if (url && navigateLuckyTarget(lucky, url)) {
+            results.innerHTML = renderTypedOutput(parsedTypedOutput, lastText);
+          } else {
+            results.innerHTML = `<div class="status">AI did not return a URL.</div>${renderAiText(lastText)}`;
+          }
+        } else {
+          results.innerHTML = parsedTypedOutput
+            ? renderTypedOutput(parsedTypedOutput, lastText)
+            : renderAiText(lastText);
+        }
+        assignAiLinkShortcuts(results);
         setEntryDebug(results, {
           kind: "ai",
           userPrompt: prompt,
@@ -3786,17 +4815,26 @@ async function runBrowserGemmaPrompt(
   });
 }
 
-async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortLevel, thread?: AiThreadContext) {
+async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortLevel, thread?: AiThreadContext, lucky?: LuckySubmit) {
   results.innerHTML = "";
   resetRunStatus(results);
   setRunStatus(results, "ai", "active");
   const expandedPrompt = expandPromptWithWindowReferences(prompt);
   const messages = threadMessagesForPrompt(expandedPrompt, thread);
   const modelPrompt = promptWithThreadFallback(expandedPrompt, messages);
-  const typedOutput = typedOutputReferences(prompt)[0]?.descriptor;
+  const typedOutput = typedOutputReferences(prompt)[0]?.descriptor ?? (lucky ? urlTypedOutputDescriptor() : undefined);
 
   if (staticMode || aiEngine === "browser-gemma") {
-    await runBrowserGemmaPrompt(prompt, modelPrompt, messages, typedOutput, results, effort, thread);
+    await runBrowserGemmaPrompt(
+      prompt,
+      typedOutput ? typedOutputInstruction(typedOutput, stripTypedOutputMarkers(modelPrompt)) : modelPrompt,
+      typedOutput && messages ? typedOutputMessages(typedOutput, messages) : messages,
+      typedOutput,
+      results,
+      effort,
+      thread,
+      lucky
+    );
     return;
   }
 
@@ -3840,15 +4878,25 @@ async function runAiPrompt(prompt: string, results: HTMLElement, effort: EffortL
 
     if (!response.ok) {
       setRunStatus(results, "ai", "error", payload.elapsedMs, "AI", aiCallPricing);
+      failLuckyTarget(lucky, payload.error ?? "AI request failed.");
       results.innerHTML = `<div class="status">${escapeHtml(payload.error ?? "AI request failed.")}</div>`;
       return;
     }
 
     setRunStatus(results, "ai", "done", payload.elapsedMs, "AI", aiCallPricing);
+    if (lucky) {
+      const url = urlFromTypedOutput(payload.typedOutput);
+      if (!url || !navigateLuckyTarget(lucky, url)) {
+        failLuckyTarget(lucky, "AI did not return a URL.");
+        results.innerHTML = `<div class="status">AI did not return a URL.</div>${renderTypedOutput(payload.typedOutput, payload.text)}`;
+        return;
+      }
+    }
     results.innerHTML = renderTypedOutput(payload.typedOutput, payload.text);
     assignAiLinkShortcuts(results);
   } catch (error) {
     setRunStatus(results, "ai", "error");
+    failLuckyTarget(lucky, error instanceof Error ? error.message : "AI request failed.");
     results.innerHTML = `<div class="status">${escapeHtml(error instanceof Error ? error.message : "AI request failed.")}</div>`;
   }
 }
@@ -3907,21 +4955,28 @@ type BrowserMoonshineMessage =
   | { type: "done"; text: string }
   | { type: "error"; error: string };
 
-function setVoiceButtonState(button: HTMLButtonElement, state: "idle" | "loading" | "recording" | "transcribing" | "error") {
+function setVoiceButtonState(button: HTMLButtonElement, state: "idle" | "loading" | "ready" | "recording" | "transcribing" | "error") {
   button.classList.toggle("loading", state === "loading");
+  button.classList.toggle("ready", state === "ready");
   button.classList.toggle("recording", state === "recording");
   button.classList.toggle("transcribing", state === "transcribing");
   button.classList.toggle("error", state === "error");
   button.disabled = state === "transcribing";
-  button.title = state === "recording"
-    ? "Stop voice input"
+  const hint = state === "recording"
+    ? t("voiceInputRecordingHint")
     : state === "loading"
-      ? "Loading browser Moonshine voice model"
+      ? t("voiceInputLoadingHint")
       : state === "transcribing"
-      ? "Transcribing with Moonshine"
-      : state === "error"
-        ? "Voice transcription failed"
-        : `Voice input with ${voiceEngine === "browser" ? "browser Moonshine" : "server Moonshine"}`;
+        ? t("voiceInputTranscribingHint")
+        : state === "error"
+          ? t("voiceInputErrorHint")
+          : t("voiceInputHint");
+  const title = state === "idle" || state === "ready"
+    ? `${t("voiceInputTitle")} (${voiceEngine === "browser" ? t("voiceMenuBrowser") : t("voiceMenuServer")})`
+    : hint;
+  button.title = title;
+  button.dataset.voiceHint = hint;
+  button.setAttribute("aria-label", state === "recording" ? t("voiceInputRecordingHint") : t("voiceInput"));
 }
 
 function refreshBrowserMoonshineButtonState() {
@@ -3934,7 +4989,27 @@ function refreshBrowserMoonshineButtonState() {
     }
     if (browserMoonshineStatus === "loading") {
       setVoiceButtonState(button, "loading");
+    } else if (browserMoonshineStatus === "ready") {
+      setVoiceButtonState(button, "ready");
     } else if (browserMoonshineStatus === "error") {
+      setVoiceButtonState(button, "error");
+    } else {
+      setVoiceButtonState(button, "idle");
+    }
+  });
+}
+
+function refreshVoiceButtonLabels() {
+  document.querySelectorAll<HTMLButtonElement>(".voice-button").forEach((button) => {
+    if (button.classList.contains("recording")) {
+      setVoiceButtonState(button, "recording");
+    } else if (button.classList.contains("transcribing")) {
+      setVoiceButtonState(button, "transcribing");
+    } else if (button.classList.contains("loading")) {
+      setVoiceButtonState(button, "loading");
+    } else if (button.classList.contains("ready")) {
+      setVoiceButtonState(button, "ready");
+    } else if (button.classList.contains("error")) {
       setVoiceButtonState(button, "error");
     } else {
       setVoiceButtonState(button, "idle");
@@ -4193,22 +5268,17 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
   }
 
   const selectedEngine = staticMode ? "browser" : voiceEngine;
-  const socket = selectedEngine === "server" ? new WebSocket(voiceWebSocketUrl()) : undefined;
+  let socket: WebSocket | undefined;
   const worker = selectedEngine === "browser"
     ? getBrowserMoonshineWorker()
     : undefined;
-  if (selectedEngine === "browser" && browserMoonshineStatus === "loading") {
-    setVoiceButtonState(button, "loading");
-  }
-
-  if (socket) {
-    await new Promise<void>((resolve, reject) => {
-      socket.addEventListener("open", () => resolve(), { once: true });
-      socket.addEventListener("error", () => reject(new Error("Voice stream could not connect.")), { once: true });
-    });
-  }
+  setVoiceButtonState(button, "loading");
 
   let recorderState: VoiceRecorderState | undefined;
+  let stream: MediaStream | undefined;
+  let context: AudioContext | undefined;
+  let source: MediaStreamAudioSourceNode | undefined;
+  let captureNode: AudioNode | undefined;
   const handleVoiceMessage = (payload: BrowserMoonshineMessage | { type?: string; status?: string; text?: string; error?: string; detail?: string }) => {
     if (payload.type === "status" && payload.status === "loading") {
       setVoiceButtonState(button, "loading");
@@ -4246,43 +5316,29 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
     }
   };
 
-  socket?.addEventListener("message", (event) => {
-    if (typeof event.data === "string") {
-      handleVoiceMessage(JSON.parse(event.data) as { type?: string; text?: string; error?: string; detail?: string });
-    }
-  });
-  socket?.addEventListener("error", () => {
-    if (recorderState) {
-      setVoiceButtonState(button, "error");
-      window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
-    }
-  });
-  socket?.addEventListener("close", () => {
-    if (recorderState && button.classList.contains("transcribing")) {
-      setVoiceButtonState(button, "idle");
-    }
-  });
   if (selectedEngine === "browser") {
     browserMoonshineActiveHandler = handleVoiceMessage;
   }
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    // Request mic access before any awaited websocket/model setup so the call
+    // still happens inside the user's click activation window.
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true
       }
     });
-    const context = new AudioContextConstructor(selectedEngine === "browser"
+    context = new AudioContextConstructor(selectedEngine === "browser"
       ? {
         sampleRate: 16000,
         latencyHint: "interactive"
       }
       : undefined);
     await context.resume();
-    const source = context.createMediaStreamSource(stream);
+    source = context.createMediaStreamSource(stream);
     const pendingPcm: Int16Array[] = [];
-    const captureNode = await createVoiceCaptureNode(context, (samples) => {
+    captureNode = await createVoiceCaptureNode(context, (samples) => {
       if (recorderState?.engine === "server") {
         pendingPcm.push(pcm16FromFloat32(samples));
       } else {
@@ -4296,6 +5352,25 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
     captureNode.connect(context.destination);
     const insertStart = input.selectionStart ?? input.value.length;
     const insertEnd = input.selectionEnd ?? insertStart;
+    if (selectedEngine === "server") {
+      socket = new WebSocket(voiceWebSocketUrl());
+      socket.addEventListener("message", (event) => {
+        if (typeof event.data === "string") {
+          handleVoiceMessage(JSON.parse(event.data) as { type?: string; text?: string; error?: string; detail?: string });
+        }
+      });
+      socket.addEventListener("error", () => {
+        if (recorderState) {
+          setVoiceButtonState(button, "error");
+          window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
+        }
+      });
+      socket.addEventListener("close", () => {
+        if (recorderState && button.classList.contains("transcribing")) {
+          setVoiceButtonState(button, "idle");
+        }
+      });
+    }
 
     recorderState = {
       engine: selectedEngine,
@@ -4320,11 +5395,18 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
       }, 30_000)
     };
     activeVoiceRecorder = recorderState;
-    socket?.send(JSON.stringify({
-      type: "start",
-      sampleRate: context.sampleRate
-    }));
     worker?.postMessage({ type: "reset" });
+    if (socket) {
+      const activeSocket = socket;
+      await new Promise<void>((resolve, reject) => {
+        activeSocket.addEventListener("open", () => resolve(), { once: true });
+        activeSocket.addEventListener("error", () => reject(new Error("Voice stream could not connect.")), { once: true });
+      });
+      activeSocket.send(JSON.stringify({
+        type: "start",
+        sampleRate: context.sampleRate
+      }));
+    }
     setVoiceButtonState(button, selectedEngine === "browser" && browserMoonshineStatus === "loading" ? "loading" : "recording");
   } catch (error) {
     socket?.close();
@@ -4332,6 +5414,15 @@ async function startVoiceRecording(button: HTMLButtonElement, input: CommandFiel
       browserMoonshineActiveHandler = undefined;
     } else {
       worker?.terminate();
+    }
+    window.clearTimeout(recorderState?.timeout);
+    window.clearInterval(recorderState?.flushInterval);
+    captureNode?.disconnect();
+    source?.disconnect();
+    stream?.getTracks().forEach((track) => track.stop());
+    await context?.close().catch(() => undefined);
+    if (activeVoiceRecorder === recorderState) {
+      activeVoiceRecorder = undefined;
     }
     throw error;
   }
@@ -4387,8 +5478,11 @@ async function stopVoiceRecording(state = activeVoiceRecorder) {
 }
 
 async function toggleVoiceRecordingForButton(button: HTMLButtonElement) {
-  const form = button.closest<HTMLFormElement>("form");
-  const voiceInput = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+  if (pendingVoiceStart) {
+    return;
+  }
+
+  const voiceInput = voiceTargetInput();
   if (!voiceInput) {
     return;
   }
@@ -4405,21 +5499,26 @@ async function toggleVoiceRecordingForButton(button: HTMLButtonElement) {
   }
 
   try {
-    await startVoiceRecording(button, voiceInput);
+    pendingVoiceStart = startVoiceRecording(button, voiceInput);
+    await pendingVoiceStart;
   } catch (error) {
     console.error(error);
     window.setTimeout(() => setVoiceButtonState(button, "idle"), 1800);
+  } finally {
+    pendingVoiceStart = undefined;
   }
 }
 
-function voiceButtonForInput(searchInput: CommandField | undefined) {
-  const block = searchInput?.closest<HTMLElement>(".entry, .current-command");
-  return block?.querySelector<HTMLButtonElement>(".voice-button");
+function voiceTargetInput() {
+  return activeSearchInput()
+    ?? (lastVoiceInput?.isConnected ? lastVoiceInput : undefined)
+    ?? input
+    ?? undefined;
 }
 
 function activeVoiceButton() {
-  return voiceButtonForInput(activeSearchInput())
-    ?? voiceButtonForInput(input ?? undefined)
+  return document.querySelector<HTMLButtonElement>("#voice-button")
+    ?? document.querySelector<HTMLButtonElement>(".site-header .voice-button")
     ?? document.querySelector<HTMLButtonElement>(".voice-button")
     ?? undefined;
 }
@@ -4439,13 +5538,14 @@ function bindVoiceButtons(root: ParentNode = document) {
       return;
     }
     button.dataset.voiceBound = "true";
-    let clickTimer: number | undefined;
-    button.addEventListener("mousedown", (event) => {
+    if (!button.dataset.voiceHint) {
+      setVoiceButtonState(button, "idle");
+    }
+    button.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) {
         return;
       }
-      const form = button.closest<HTMLFormElement>("form");
-      const voiceInput = form?.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
+      const voiceInput = voiceTargetInput();
       if (!voiceInput) {
         return;
       }
@@ -4453,15 +5553,17 @@ function bindVoiceButtons(root: ParentNode = document) {
       event.preventDefault();
       focusCommandInput(voiceInput, selection);
     });
-    button.addEventListener("click", () => {
-      window.clearTimeout(clickTimer);
-      clickTimer = window.setTimeout(() => {
-        void toggleVoiceRecordingForButton(button);
-      }, 220);
+    button.addEventListener("click", (event) => {
+      if (event.detail > 1) {
+        return;
+      }
+      void toggleVoiceRecordingForButton(button);
     });
-    button.addEventListener("dblclick", (event) => {
+    button.addEventListener("dblclick", async (event) => {
       event.preventDefault();
-      window.clearTimeout(clickTimer);
+      if (activeVoiceRecorder?.button === button) {
+        await stopVoiceRecording(activeVoiceRecorder);
+      }
       openVoiceMenu(button);
     });
   });
@@ -4498,22 +5600,56 @@ function appendAiTurn(results: HTMLElement, prompt: string) {
 // can keep the conversation going.
 function appendEmptyTurnInput(entry: HTMLElement) {
   if (entry.dataset.mode !== "ai") {
-    return;
+    return undefined;
   }
   const results = entry.querySelector<HTMLElement>(".results");
   if (!results) {
-    return;
+    return undefined;
   }
   const existing = entry.querySelector<HTMLElement>(".ai-turn:last-child");
   // Reuse a trailing empty turn if one is already there.
   if (existing && !existing.querySelector(".ai-turn-body")?.textContent?.trim()
     && !existing.querySelector<CommandField>(".entry-input")?.value.trim()) {
-    existing.querySelector<CommandField>(".entry-input")?.focus();
-    return;
+    const existingInput = existing.querySelector<CommandField>(".entry-input");
+    if (existingInput) {
+      focusCommandInput(existingInput);
+      scrollSearchInputIntoView(existingInput);
+    }
+    return existingInput;
   }
   const turn = buildTurn();
   results.append(turn);
-  turn.querySelector<CommandField>(".entry-input")?.focus();
+  const turnInput = turn.querySelector<CommandField>(".entry-input");
+  if (turnInput) {
+    focusCommandInput(turnInput);
+    scrollSearchInputIntoView(turnInput);
+  }
+  return turnInput;
+}
+
+function enqueueAiTurn(entry: HTMLElement, turn: HTMLElement, query: string, body: HTMLElement, effort: EffortLevel, lucky?: LuckySubmit) {
+  const previous = aiRunQueues.get(entry);
+  if (previous) {
+    body.innerHTML = `<div class="status">Queued</div>`;
+  }
+
+  const run = (previous ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(async () => {
+      if (!entry.isConnected || !turn.isConnected || !body.isConnected) {
+        return;
+      }
+      const thread = aiThreadContext(entry, turn);
+      await runAiPrompt(query, body, effort, thread.turns.length > 0 ? thread : undefined, lucky);
+    });
+
+  aiRunQueues.set(entry, run);
+  void run.finally(() => {
+    if (aiRunQueues.get(entry) === run) {
+      aiRunQueues.delete(entry);
+    }
+  });
+  return run;
 }
 
 // Remove every turn after the given one (used when an earlier message is edited
@@ -4538,10 +5674,13 @@ document.addEventListener("submit", async (event) => {
   }
 
   event.preventDefault();
+  const lucky = luckySubmits.get(submittedForm);
+  luckySubmits.delete(submittedForm);
 
   const searchInput = submittedForm.querySelector<CommandField>('textarea[name="q"], input[name="q"]');
   const query = searchInput?.value.trim() ?? "";
   if (!query || !searchInput || !transcript) {
+    failLuckyTarget(lucky, "Nothing to open.");
     return;
   }
 
@@ -4556,16 +5695,13 @@ document.addEventListener("submit", async (event) => {
       return;
     }
     const entryEffort = Math.min(Math.max(Number(entry.dataset.effort ?? 3), 1), 5) as EffortLevel;
-    // Context is the turns before this one; later turns are discarded.
-    const thread = aiThreadContext(entry, turn);
     truncateTurnsAfter(turn);
     turn.dataset.prompt = query;
     body.innerHTML = "";
     clearSuggestionsFor(searchInput);
     suggestAbort?.abort();
-    await runAiPrompt(query, body, entryEffort, thread);
     appendEmptyTurnInput(entry);
-    scrollToPrompt();
+    void enqueueAiTurn(entry, turn, query, body, entryEffort, lucky);
     return;
   }
 
@@ -4578,6 +5714,7 @@ document.addEventListener("submit", async (event) => {
         entry.dataset.originalQuery = query;
       }
       if (slashCommandForQuery(query)) {
+        failLuckyTarget(lucky, "Lucky open is available for search and AI prompts.");
         await runSlashCommand(query, results, searchInput);
       } else if (entry?.dataset.mode === "ai") {
         results.innerHTML = "";
@@ -4587,12 +5724,15 @@ document.addEventListener("submit", async (event) => {
         resizeCommandField(searchInput);
         updateCommandHighlight(searchInput);
         const body = appendAiTurn(results, query);
-        await runAiPrompt(query, body, entryEffort);
         if (entry) {
           appendEmptyTurnInput(entry);
+          const turn = body.closest<HTMLElement>(".ai-turn");
+          if (turn) {
+            void enqueueAiTurn(entry, turn, query, body, entryEffort, lucky);
+          }
         }
       } else {
-        await runSearch(query, results, entryEffort);
+        await runSearch(query, results, entryEffort, lucky);
         renumberSuggestionShortcuts(searchInput);
       }
     }
@@ -4629,14 +5769,25 @@ document.addEventListener("submit", async (event) => {
   clearSuggestionsFor(searchInput);
   suggestAbort?.abort();
   setCommandMode(submittedMode);
-  searchInput.focus();
-  scrollToPrompt();
+  if (submittedMode === "ai") {
+    if (!lucky) {
+      searchInput.blur();
+    }
+  } else if (!lucky) {
+    searchInput.focus();
+    if (isMobileViewport()) {
+      scrollToSubmittedEntry(node);
+    } else {
+      scrollToPrompt();
+    }
+  }
 
   const results = node.querySelector<HTMLElement>(".results");
   const createdEntry = node.querySelector<HTMLElement>(".entry");
   if (results) {
     const persistedInput = node.querySelector<CommandField>(".entry-input");
     if (submittedSlashCommand && persistedInput) {
+      failLuckyTarget(lucky, "Lucky open is available for search and AI prompts.");
       await runSlashCommand(query, results, persistedInput);
     } else if (submittedMode === "ai") {
       // The conversation owns the message as turn 1; clear the created entry's
@@ -4648,18 +5799,27 @@ document.addEventListener("submit", async (event) => {
         updateCommandHighlight(createdInput);
       }
       const body = appendAiTurn(results, query);
-      await runAiPrompt(query, body, submittedEffort);
       if (createdEntry) {
         appendEmptyTurnInput(createdEntry);
+        const turn = body.closest<HTMLElement>(".ai-turn");
+        if (turn) {
+          void enqueueAiTurn(createdEntry, turn, query, body, submittedEffort, lucky);
+        }
       }
     } else {
-      await runSearch(query, results, submittedEffort);
+      await runSearch(query, results, submittedEffort, lucky);
       if (persistedInput) {
         renumberSuggestionShortcuts(persistedInput);
       }
     }
   }
-  scrollToPrompt();
+  if (submittedMode !== "ai" && !lucky) {
+    if (isMobileViewport()) {
+      scrollToSubmittedEntry(node);
+    } else {
+      scrollToPrompt();
+    }
+  }
 });
 
 scrollToPrompt();

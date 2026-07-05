@@ -118,7 +118,7 @@ export interface SuggestionPlacement {
 
 export interface SlashCommandPlacement {
   target: "results";
-  renderer: "weather-card" | "lanes-card" | "json";
+  renderer: "weather-card" | "lanes-card" | "stock-card" | "json";
 }
 
 export interface SuggestPluginResultSet {
@@ -159,7 +159,7 @@ export interface SearchShapeResponse {
   elapsedMs: number;
 }
 
-export type TypedOutputRenderer = "markdown" | "boolean" | "restaurant-card" | "restaurant-list" | "json";
+export type TypedOutputRenderer = "markdown" | "boolean" | "url" | "restaurant-card" | "restaurant-list" | "json";
 
 export interface TypedOutputDescriptor {
   id: string;

@@ -1,4 +1,5 @@
 import type { EffortLevel, SearchResult } from "../models";
+import { envVar } from "../runtimeEnv";
 import { type GeneratorDescriptor, type WebSearchRequest } from "./base";
 import { GenericWebSearchGenerator } from "./exa";
 
@@ -26,7 +27,7 @@ export abstract class SerpApiWebSearchGenerator extends GenericWebSearchGenerato
   protected abstract readonly numResults: number;
 
   enabled() {
-    return Boolean(process.env.SERP_API_KEY);
+    return Boolean(envVar("SERP_API_KEY"));
   }
 
   describe(): GeneratorDescriptor {
@@ -44,7 +45,7 @@ export abstract class SerpApiWebSearchGenerator extends GenericWebSearchGenerato
   }
 
   async execute(request: WebSearchRequest): Promise<SearchResult[]> {
-    const apiKey = process.env.SERP_API_KEY;
+    const apiKey = envVar("SERP_API_KEY");
     if (!apiKey) {
       throw new Error("SERP_API_KEY is not set.");
     }
